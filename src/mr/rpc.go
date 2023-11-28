@@ -6,24 +6,35 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
+import (
+	"os"
+)
 import "strconv"
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
+// MapReduce RPC definitions
 
-type ExampleArgs struct {
-	X int
+type TaskType int
+
+const (
+	Map TaskType = iota
+	Reduce
+	Exit
+)
+
+type RegisterWorkerArgs struct {
+	WorkerId string
 }
 
-type ExampleReply struct {
-	Y int
+type RegisterWorkerResponse struct {
+	Successful bool
 }
 
-// Add your RPC definitions here.
+type FetchTaskArgs struct {
+	WorkerId string
+}
 
+type FetchTaskResponse struct {
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
