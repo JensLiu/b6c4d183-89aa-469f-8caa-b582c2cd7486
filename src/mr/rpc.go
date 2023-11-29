@@ -16,9 +16,9 @@ import "strconv"
 type TaskType int
 
 const (
-	Map TaskType = iota
-	Reduce
-	Exit
+	MapTask TaskType = iota
+	ReduceTask
+	ExitTask
 )
 
 type RegisterWorkerArgs struct {
@@ -33,7 +33,29 @@ type FetchTaskArgs struct {
 	WorkerId string
 }
 
-type FetchTaskResponse struct {
+type FetchTaskReply struct {
+	TaskId     string
+	TaskType   TaskType
+	InputFiles []string
+}
+
+type CommitTaskArgs struct {
+	WorkerId              string
+	TaskId                string
+	TaskType              TaskType
+	MapTaskOutputFiles    map[string][]string
+	ReduceTaskOutputFiles []string
+}
+
+type CommitTaskReply struct {
+	Successful bool
+}
+
+type FetchNReduceArgs struct {
+}
+
+type FetchNReduceReply struct {
+	NReduce int
 }
 
 // Cook up a unique-ish UNIX-domain socket name
