@@ -20,13 +20,14 @@ type ReduceExecutionContext struct {
 	// task specific
 	WorkingTaskId   string
 	InputFileStatus []inputFileStatus
+	Result          ReduceTaskOutputFiles
 }
 
 func MakeReduceExecutionContext(executor *WorkerExecutor, task *WorkerTask) *ReduceExecutionContext {
 	ctx := &ReduceExecutionContext{
 		WorkerId:       executor.WorkerId,
 		ReduceFunction: executor.ReduceFunction,
-		WorkingTaskId:  task.Id,
+		WorkingTaskId:  task.TaskId,
 	}
 	ctx.SetInputFiles(task.InputFiles)
 	return ctx
@@ -91,9 +92,18 @@ func (ctx *ReduceExecutionContext) Execute() {
 		i = j
 	}
 	os.Rename(outputFile.Name(), outputFilename)
+	ctx.Result = []string{outputFilename}
 	fmt.Printf("worker %v reduce task %v finished\n", ctx.WorkerId, ctx.WorkingTaskId)
 }
 
 func IntermediateFilename(mapTaskId string, reduceTaskId string) string {
 	return fmt.Sprintf("mr-%v-%v", mapTaskId, reduceTaskId)
+}
+
+func (ctx *ReduceExecutionContext) GetMapTaskOutputFiles() (MapTaskOutputFiles, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (ctx *ReduceExecutionContext) GetReduceTaskOutputFiles() (ReduceTaskOutputFiles, error) {
+	return ctx.Result, nil
 }

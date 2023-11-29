@@ -9,6 +9,8 @@ import (
 	"strconv"
 )
 
+type MapTaskOutputFiles map[string][]string
+
 type outputFileStatus struct {
 	//Key            string
 	ReduceTaskId   string
@@ -26,6 +28,7 @@ type MapExecutionContext struct {
 	WorkingTaskId     string
 	InputFiles        []string
 	OutputFilesStatus map[string]outputFileStatus // map: ReduceTaskId -> outputFileStatus
+	Result            MapTaskOutputFiles
 }
 
 func MakeMapExecutionContext(executor *WorkerExecutor, task *WorkerTask) *MapExecutionContext {
@@ -33,7 +36,7 @@ func MakeMapExecutionContext(executor *WorkerExecutor, task *WorkerTask) *MapExe
 		WorkerId:          executor.WorkerId,
 		MapFunction:       executor.MapFunction,
 		NReduce:           task.NReduce,
-		WorkingTaskId:     task.Id,
+		WorkingTaskId:     task.TaskId,
 		InputFiles:        task.InputFiles,
 		OutputFilesStatus: make(map[string]outputFileStatus),
 	}
@@ -56,10 +59,11 @@ func (ctx *MapExecutionContext) Execute() {
 			ctx.writeKV(&kv)
 		}
 	}
+	ctx.Result = ctx.atomicRename()
 }
 
-func (ctx *MapExecutionContext) atomicRename() map[string][]string {
-	m := make(map[string][]string)
+func (ctx *MapExecutionContext) atomicRename() MapTaskOutputFiles {
+	m := make(MapTaskOutputFiles)
 	for _, status := range ctx.OutputFilesStatus {
 		err := os.Rename(status.OutputFile.Name(), status.OutputFileName)
 		if err != nil {
@@ -117,4 +121,11 @@ func (ctx *MapExecutionContext) closeFiles() {
 
 func (ctx *MapExecutionContext) cleanUps() {
 	ctx.closeFiles()
+}
+
+func (ctx *MapExecutionContext) GetMapTaskOutputFiles() (MapTaskOutputFiles, error) {
+	return ctx.Result, nil
+}
+func (ctx *MapExecutionContext) GetReduceTaskOutputFiles() (ReduceTaskOutputFiles, error) {
+	return nil, fmt.Errorf("not implemented")
 }
