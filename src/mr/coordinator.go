@@ -1,11 +1,13 @@
 package mr
 
 import (
+	"fmt"
 	"log"
 	"math"
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 import "net"
 import "os"
@@ -33,6 +35,7 @@ type WorkerInfo struct {
 	WorkerStatus      WorkerStatus
 	ExecutingTaskId   string
 	ExecutingTaskType TaskType
+	Badness           int // worker timeout count
 }
 
 type simpleTaskInfo struct {
@@ -41,7 +44,11 @@ type simpleTaskInfo struct {
 	TaskType   TaskType
 	InputFiles []string
 	// execution specific
-	ExecutionStatus TaskStatus
+	ExecutionStatus              TaskStatus
+	MostRecentlyAssignedWorkerId string
+	// if a worker times out, the coordinator would recycle the task
+	// the timeout function need to know if the task has been recycled
+	// by checking if this field is the worker's id
 }
 
 type incrementalUpdateInfo struct {
@@ -51,39 +58,51 @@ type incrementalUpdateInfo struct {
 }
 
 type Coordinator struct {
-	InProgressMapTaskCount     atomic.Int32
-	InProgressReduceTaskCount  atomic.Int32
+	UnfinishedMapTaskCount    atomic.Int32
+	UnfinishedReduceTaskCount atomic.Int32
+
+	// WorkerTimeoutCount
+	// a worker may time out, there's a corner case where the map workers time out frequently
+	// while reduce workers are pending for map to finish, thus they will never start
+	// we address this by forcing reduce workers to check for this timeout count after being woken up
+	// if the timeout count increased, it means that some map task timed out and the reduce task worker might
+	// be scheduled to be the next map worker
+	WorkerTimeoutCount         atomic.Int32
 	CondAllMapTasksFinished    *sync.Cond
 	CondAllReduceTasksFinished *sync.Cond
-	MapTasks                   map[string]simpleTaskInfo // map: MapTaskId -> taskInfo
-	MapMutex                   *sync.Mutex               // locks MapTasks
-	ReduceTasks                map[string]simpleTaskInfo // map: ReduceTaskId -> taskInfo
-	ReduceMutex                *sync.Mutex               // locks ReduceTasks
-	WorkerInfos                map[string]WorkerInfo     // map: WorkerId -> workerInfo
-	WorkerMutex                *sync.Mutex               // locks WorkerInfos
+
+	MapTasks              map[string]*simpleTaskInfo // map: MapTaskId -> taskInfo
+	MapMutex              *sync.Mutex                // locks MapTasks
+	ReduceTasks           map[string]*simpleTaskInfo // map: ReduceTaskId -> taskInfo
+	ReduceMutex           *sync.Mutex                // locks ReduceTasks
+	WorkerInfos           map[string]*WorkerInfo     // map: WorkerId -> workerInfo
+	WorkerMutex           *sync.Mutex                // locks WorkerInfos
+	WorkerTimeoutDuration time.Duration
 }
 
 func (ctx *Coordinator) InitMapTasks(inputFiles []string) {
 	// we by default schedule one map task per file
 	for mapTaskId, mapTaskFile := range inputFiles {
-		ctx.MapTasks[strconv.Itoa(mapTaskId)] = simpleTaskInfo{
+		ctx.MapTasks[strconv.Itoa(mapTaskId)] = &simpleTaskInfo{
 			TaskId:          strconv.Itoa(mapTaskId),
 			TaskType:        MapTask,
 			ExecutionStatus: TaskIdle,
 			InputFiles:      []string{mapTaskFile},
 		}
 	}
+	ctx.UnfinishedMapTaskCount.Store(int32(len(ctx.MapTasks)))
 }
 
 func (ctx *Coordinator) InitReduceTasks(nReduce int) {
 	for reduceTaskId := 0; reduceTaskId < nReduce; reduceTaskId++ {
-		ctx.ReduceTasks[strconv.Itoa(reduceTaskId)] = simpleTaskInfo{
+		ctx.ReduceTasks[strconv.Itoa(reduceTaskId)] = &simpleTaskInfo{
 			TaskId:          strconv.Itoa(reduceTaskId),
 			TaskType:        ReduceTask,
 			ExecutionStatus: TaskIdle,
 			InputFiles:      make([]string, 0),
 		}
 	}
+	ctx.UnfinishedReduceTaskCount.Store(int32(len(ctx.ReduceTasks)))
 }
 
 func (ctx *Coordinator) InitLocks() {
@@ -95,38 +114,37 @@ func (ctx *Coordinator) InitLocks() {
 }
 
 func (ctx *Coordinator) InitMetadata() {
-	ctx.InProgressReduceTaskCount.Store(0)
-	ctx.InProgressMapTaskCount.Store(0)
-	ctx.MapTasks = make(map[string]simpleTaskInfo)
-	ctx.ReduceTasks = make(map[string]simpleTaskInfo)
-	ctx.WorkerInfos = make(map[string]WorkerInfo)
+	ctx.MapTasks = make(map[string]*simpleTaskInfo)
+	ctx.ReduceTasks = make(map[string]*simpleTaskInfo)
+	ctx.WorkerInfos = make(map[string]*WorkerInfo)
 }
 
-func (ctx *Coordinator) tryScheduleOneMapTask() *simpleTaskInfo {
+func (ctx *Coordinator) tryScheduleOneMapTask(workerId string) *simpleTaskInfo {
 	for taskId, info := range ctx.MapTasks {
 		if info.ExecutionStatus == TaskIdle {
 			info.ExecutionStatus = TaskInProgress
+			info.MostRecentlyAssignedWorkerId = workerId
 			ctx.MapTasks[taskId] = info
-			ctx.InProgressMapTaskCount.Add(1)
-			return &info
+			return info
 		}
 	}
 	return nil
 }
 
-func (ctx *Coordinator) tryScheduleOneReduceTask() *simpleTaskInfo {
+func (ctx *Coordinator) tryScheduleOneReduceTask(workerId string) *simpleTaskInfo {
 	for taskId, info := range ctx.ReduceTasks {
 		if info.ExecutionStatus == TaskIdle {
 			info.ExecutionStatus = TaskInProgress
+			info.MostRecentlyAssignedWorkerId = workerId
 			ctx.ReduceTasks[taskId] = info
-			ctx.InProgressReduceTaskCount.Add(1)
-			return &info
+			return info
 		}
 	}
 	return nil
 }
 
-func (ctx *Coordinator) tryScheduleOneTask(workerId string) *simpleTaskInfo {
+// lock dependency: none?
+func (ctx *Coordinator) schedule(workerId string) *simpleTaskInfo {
 	// NOTE(jens): simplification
 	// workers with WorkerId greater than all map tasks are considered to be assigned reduce tasks
 	// and will block here until all map tasks are finished
@@ -137,36 +155,47 @@ func (ctx *Coordinator) tryScheduleOneTask(workerId string) *simpleTaskInfo {
 		return nil
 	}
 
+schedule:
 	for {
+		localWorkerTimeoutCount := ctx.WorkerTimeoutCount.Load()
+		// MapMutex scope begin
 		ctx.MapMutex.Lock()
-		task := ctx.tryScheduleOneMapTask()
+		task := ctx.tryScheduleOneMapTask(workerId)
 		if task != nil {
 			ctx.MapMutex.Unlock()
+			// WorkerMutex scope begin
 			ctx.WorkerMutex.Lock()
-			ctx.WorkerInfos[workerId] = WorkerInfo{
+			ctx.WorkerInfos[workerId] = &WorkerInfo{
 				WorkerId:          workerId,
 				WorkerStatus:      WorkerInProgress,
 				ExecutingTaskId:   task.TaskId,
 				ExecutingTaskType: task.TaskType,
 			}
 			ctx.WorkerMutex.Unlock()
+			// WorkerMutex
 			log.Printf("Worker %v, scheduled map-task %v\n", workerId, task.TaskId)
 			return task
 		}
 		// all map tasks are scheduled, they are either in progress of finished
-		for !ctx.InProgressMapTaskCount.CompareAndSwap(0, 0) { // not all map tasks are finished
+		for !ctx.UnfinishedMapTaskCount.CompareAndSwap(0, 0) { // not all map tasks are finished
 			log.Printf("Worker %v, wait for all map-tasks to finish\n", workerId)
 			ctx.CondAllMapTasksFinished.Wait()
+			if localWorkerTimeoutCount < ctx.WorkerTimeoutCount.Load() {
+				// maybe another thread died and the scheduler recycled the task
+				ctx.MapMutex.Unlock()
+				goto schedule
+			}
 		} // all map tasks are finished
 		ctx.MapMutex.Unlock()
+		// MapMutex scope end
 
 		ctx.ReduceMutex.Lock()
-		task = ctx.tryScheduleOneReduceTask()
+		task = ctx.tryScheduleOneReduceTask(workerId)
 		if task != nil {
 			ctx.ReduceMutex.Unlock()
 			log.Printf("Worker %v, scheduled reduce-task %v\n", workerId, task.TaskId)
 			ctx.WorkerMutex.Lock()
-			ctx.WorkerInfos[workerId] = WorkerInfo{
+			ctx.WorkerInfos[workerId] = &WorkerInfo{
 				WorkerId:          workerId,
 				WorkerStatus:      WorkerInProgress,
 				ExecutingTaskId:   task.TaskId,
@@ -176,18 +205,89 @@ func (ctx *Coordinator) tryScheduleOneTask(workerId string) *simpleTaskInfo {
 			return task
 		} // all reduce tasks are scheduled, they are either in progress of finished
 		for {
-			if ctx.InProgressReduceTaskCount.CompareAndSwap(0, 0) {
+			if ctx.UnfinishedReduceTaskCount.CompareAndSwap(0, 0) {
 				// all reduce tasks completed
 				ctx.ReduceMutex.Unlock()
 				return nil
 			} // not all reduce tasks are finished
 			log.Printf("Worker %v, wait for all reduce tasks to finish\n", workerId)
 			ctx.CondAllReduceTasksFinished.Wait()
+			if localWorkerTimeoutCount < ctx.WorkerTimeoutCount.Load() {
+				ctx.ReduceMutex.Unlock()
+				goto schedule
+			}
 		}
 	}
 }
 
-func (ctx *Coordinator) onCommitReleaseWorker(workerId string, taskType TaskType) *WorkerInfo {
+// lock dependency none
+func (ctx *Coordinator) startWorkerTimer(workerId string, task simpleTaskInfo) {
+	// do not pass by pointer to keep a local copy
+	go func(workerId string, task simpleTaskInfo) {
+		time.Sleep(ctx.WorkerTimeoutDuration)
+		ctx.WorkerMutex.Lock()
+		if workerInfo, ok := ctx.WorkerInfos[workerId]; !ok {
+			ctx.WorkerMutex.Unlock()
+			log.Fatalf("worker %v not found", workerId)
+			return
+		} else {
+			if workerInfo.WorkerStatus == WorkerInProgress &&
+				workerInfo.ExecutingTaskId == task.TaskId &&
+				workerInfo.ExecutingTaskType == task.TaskType {
+				// worker did not respond
+				workerInfo.Badness++
+				// recycle the worker
+				ctx.WorkerInfos[workerId] = &WorkerInfo{
+					WorkerId:          workerId,
+					WorkerStatus:      WorkerIdle,
+					ExecutingTaskId:   "",
+					ExecutingTaskType: InvalidTask,
+				}
+				ctx.WorkerMutex.Unlock()
+
+				ctx.WorkerTimeoutCount.Add(1)
+
+				// recycle the task
+				switch task.TaskType {
+				case MapTask:
+					log.Printf("timer went off: worker %v, recycle map-task %v", workerId, task.TaskId)
+					ctx.MapMutex.Lock()
+					if t, ok := ctx.MapTasks[task.TaskId]; ok && t.MostRecentlyAssignedWorkerId == workerId {
+						// the worker timed out and the task has not been recycled
+						t.ExecutionStatus = TaskIdle
+						t.MostRecentlyAssignedWorkerId = ""
+						ctx.MapTasks[task.TaskId] = t
+					}
+					ctx.MapMutex.Unlock()
+				case ReduceTask:
+					log.Printf("timer went off: worker %v, recycle reduce-task %v", workerId, task.TaskId)
+					ctx.ReduceMutex.Lock()
+					if t, ok := ctx.ReduceTasks[task.TaskId]; ok && t.MostRecentlyAssignedWorkerId == workerId {
+						// the worker timed out and the task has not been recycled
+						t.ExecutionStatus = TaskIdle
+						t.MostRecentlyAssignedWorkerId = ""
+						ctx.ReduceTasks[task.TaskId] = t
+					}
+					ctx.ReduceMutex.Unlock()
+				}
+				ctx.CondAllReduceTasksFinished.Broadcast()
+				ctx.CondAllMapTasksFinished.Broadcast()
+			} else {
+				ctx.WorkerMutex.Unlock()
+			}
+		}
+	}(workerId, task)
+}
+
+func (ctx *Coordinator) fetchOneTask(workerId string) *simpleTaskInfo {
+	task := ctx.schedule(workerId)
+	if task != nil {
+		ctx.startWorkerTimer(workerId, *task)
+	}
+	return task
+}
+
+func (ctx *Coordinator) onCommitReleaseWorker(workerId string, localTaskType TaskType) *WorkerInfo {
 	ctx.WorkerMutex.Lock()
 	defer ctx.WorkerMutex.Unlock()
 
@@ -196,22 +296,24 @@ func (ctx *Coordinator) onCommitReleaseWorker(workerId string, taskType TaskType
 		return nil
 	}
 
-	if ctx.WorkerInfos[workerId].ExecutingTaskType != taskType {
-		taskString := []string{"map", "reduce"}
-		log.Fatalf("worker %v is not commiting a %v-task, %v", workerId, taskString[taskType], ctx.WorkerInfos[workerId])
+	if ctxTaskType := ctx.WorkerInfos[workerId].ExecutingTaskType; ctxTaskType == InvalidTask {
+		log.Printf("worker %v is recycled, assume the worker dead and ignore its result", workerId)
+		return nil
+	} else if ctxTaskType != localTaskType {
+		log.Fatalf("worker %v is not commiting a %v-task, %v", workerId, localTaskType, ctx.WorkerInfos[workerId])
 		return nil
 	}
 
 	old := ctx.WorkerInfos[workerId]
 
-	ctx.WorkerInfos[workerId] = WorkerInfo{
+	ctx.WorkerInfos[workerId] = &WorkerInfo{
 		WorkerId:          workerId,
 		WorkerStatus:      WorkerIdle,
 		ExecutingTaskId:   "",
-		ExecutingTaskType: -1,
+		ExecutingTaskType: InvalidTask,
 	}
 
-	return &old
+	return old
 }
 
 func (ctx *Coordinator) onCommitAcceptTask(workerInfo *WorkerInfo, taskType TaskType) *simpleTaskInfo {
@@ -222,38 +324,42 @@ func (ctx *Coordinator) onCommitAcceptTask(workerInfo *WorkerInfo, taskType Task
 	switch taskType {
 	case MapTask:
 		ctx.MapMutex.Lock()
+		defer ctx.MapMutex.Unlock()
 		if _, ok := ctx.MapTasks[taskId]; !ok {
 			log.Fatalf("map-task %v not found", taskId)
 			return nil
 		}
-		t := ctx.MapTasks[taskId]
-		task = &t
+		task = ctx.MapTasks[taskId]
 		if task.ExecutionStatus == TaskCompleted {
 			log.Printf("map-task %v is already done by another worker, current worker %v rejected",
 				taskId, workerInfo.WorkerId)
 			return nil
 		}
-		ctx.MapMutex.Unlock()
+		task.ExecutionStatus = TaskCompleted
+		ctx.MapTasks[taskId] = task
+		log.Printf("map-task %v state %v\n", taskId, ctx.MapTasks[taskId].ExecutionStatus)
 	case ReduceTask:
 		ctx.ReduceMutex.Lock()
+		defer ctx.ReduceMutex.Unlock()
 		if _, ok := ctx.ReduceTasks[taskId]; !ok {
 			log.Fatalf("reduce-task %v not found", taskId)
 			return nil
 		}
-		t := ctx.ReduceTasks[taskId]
-		task = &t
+		task = ctx.ReduceTasks[taskId]
 		if task.ExecutionStatus == TaskCompleted {
 			log.Printf("reduce-task %v is already done by another worker, current worker %v rejected",
 				taskId, workerInfo.WorkerId)
 			return nil
 		}
-		ctx.ReduceMutex.Unlock()
+		task.ExecutionStatus = TaskCompleted
+		ctx.ReduceTasks[taskId] = task
+		log.Printf("reduce-task %v state: %v\n", taskId, ctx.ReduceTasks[taskId].ExecutionStatus)
 	}
 
 	return task
 }
 
-func (ctx *Coordinator) CommitMapTask(workerId string, outputFiles map[string][]string) {
+func (ctx *Coordinator) CommitMapTask(workerId string, outputFiles MapTaskOutputFiles) {
 	workerInfo := ctx.onCommitReleaseWorker(workerId, MapTask)
 	if workerInfo == nil {
 		return
@@ -282,9 +388,13 @@ func (ctx *Coordinator) CommitMapTask(workerId string, outputFiles map[string][]
 	ctx.ReduceMutex.Unlock()
 
 	// broadcast if all completed
-	if ctx.InProgressMapTaskCount.Add(-1) == 0 {
+	// Note(jens): to address the lost wakeup problem
+	// 	lock first before modifying ctx.UnfinishedMapTaskCount
+	ctx.MapMutex.Lock()
+	if ctx.UnfinishedMapTaskCount.Add(-1) == 0 {
 		ctx.CondAllMapTasksFinished.Broadcast()
 	}
+	ctx.MapMutex.Unlock()
 
 }
 
@@ -299,12 +409,14 @@ func (ctx *Coordinator) CommitReduceTask(workerId string, outputFiles []string) 
 	}
 
 	// accept results
-	log.Printf("%v", outputFiles)
+	//log.Printf("%v", outputFiles)
 
 	// broadcast if all completed
-	if ctx.InProgressReduceTaskCount.Add(-1) == 0 {
+	ctx.ReduceMutex.Lock()
+	if ctx.UnfinishedReduceTaskCount.Add(-1) == 0 {
 		ctx.CondAllReduceTasksFinished.Broadcast()
 	}
+	ctx.ReduceMutex.Unlock()
 }
 
 // PC handlers for the worker to call.
@@ -318,7 +430,7 @@ func (ctx *Coordinator) RegisterWorker(args RegisterWorkerArgs, response *Regist
 		return nil
 	}
 	// add to worker
-	workerInfo := WorkerInfo{
+	workerInfo := &WorkerInfo{
 		WorkerId:     args.WorkerId,
 		WorkerStatus: WorkerIdle,
 	}
@@ -338,7 +450,7 @@ func (ctx *Coordinator) FetchTask(args *FetchTaskArgs, reply *FetchTaskReply) er
 		log.Fatalf("worker %v is not idle", args.WorkerId)
 		return nil
 	}
-	task := ctx.tryScheduleOneTask(args.WorkerId)
+	task := ctx.fetchOneTask(args.WorkerId)
 	if task == nil {
 		reply.TaskType = ExitTask
 		return nil
@@ -355,6 +467,8 @@ func (ctx *Coordinator) CommitTask(args *CommitTaskArgs, _ *CommitTaskReply) err
 		ctx.CommitMapTask(args.WorkerId, args.MapTaskOutputFiles)
 	case ReduceTask:
 		ctx.CommitReduceTask(args.WorkerId, args.ReduceTaskOutputFiles)
+	default:
+		_ = fmt.Errorf("invalid task")
 	}
 	return nil
 }
@@ -403,7 +517,7 @@ func (ctx *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (ctx *Coordinator) Done() bool {
-	return ctx.InProgressMapTaskCount.Load() == 0 && ctx.InProgressReduceTaskCount.Load() == 0
+	return ctx.UnfinishedMapTaskCount.Load() == 0 && ctx.UnfinishedReduceTaskCount.Load() == 0
 }
 
 // MakeCoordinator
@@ -416,7 +530,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.InitMetadata()
 	c.InitMapTasks(files)
 	c.InitReduceTasks(nReduce)
-
+	c.WorkerTimeoutDuration = 10 * time.Second
 	c.server()
 	return &c
 }

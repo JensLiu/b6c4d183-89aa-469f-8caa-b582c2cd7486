@@ -16,7 +16,8 @@ import "strconv"
 type TaskType int
 
 const (
-	MapTask TaskType = iota
+	InvalidTask TaskType = iota
+	MapTask
 	ReduceTask
 	ExitTask
 )
