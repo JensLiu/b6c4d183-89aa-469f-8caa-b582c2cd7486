@@ -249,7 +249,7 @@ func (rf *Raft) ticker() {
 			DPrintf(dTimr, "S%v(T%v) Election timeout\n", rf.me, rf.currentTerm)
 			// non-blocking election so that the election timeout can kick off
 			go func() { // lock held
-				rf.election() // lock held on return, released on wait
+				rf.startElection() // lock held on return, released on wait
 				if rf.currentState == PeerLeader {
 					// TODO(jens): in lab2B, initialise nextIndex, matchIndex
 					go rf.heartbeat()

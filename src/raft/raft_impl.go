@@ -9,14 +9,13 @@ import (
 
 // the caller should hold mu mutex to make the election atomic,
 // and it is its responsibility to unlock it
-func (rf *Raft) election() {
+func (rf *Raft) startElection() {
 	if rf.mu.TryLock() {
 		panic("the caller should hold mutex before entering the election period")
 	}
 	rf.currentTerm += 1
 	rf.currentState = PeerCandidate
-	rf.delta += 1 // reset timer
-	DPrintf(dAppd, "S%v(T%v, %v) Reset Timer\n", rf.me, rf.currentTerm, rf.currentState.ToString())
+	rf.resetElectionTimer()
 	rf.votedFor = rf.me // vote for itself
 	ballet := 1
 	DPrintf(dElec, "S%v(T%v, %v) Started election\n", rf.me, rf.currentTerm, rf.currentState.ToString())
@@ -26,58 +25,55 @@ func (rf *Raft) election() {
 		if peerId == rf.me {
 			continue
 		}
-		go func(rfRef *Raft, ballet *int, peerId int, peer *labrpc.ClientEnd, localTerm int) {
-			//DPrintf(dElec, "S%v(T%v, %v) -> S%v(T%v) Ask Vote\n", rf.me, rf.currentTerm, rf.currentState.ToString(), peerId, localTerm)	// race read
-
-			reply := RequestVoteReply{}
-			// cannot use mutating rfRef.* without mutex
-			if !peer.Call("Raft.RequestVote", &RequestVoteArgs{
-				Term:         localTerm,
-				CandidateId:  rfRef.me, // this field is assumed constant
-				LastLogIndex: 0,
-				LastLogTerm:  0,
-			}, &reply) {
-				// no reply from the client, retrying?
-				return
-			}
-
-			rfRef.mu.Lock()
-			defer rfRef.mu.Unlock()
-
-			if localTerm != rfRef.currentTerm {
-				// maybe this is an obsolete vote reply for the previous election
-				return
-			}
-			// reply.Term >= localTerm = rfRef.currentTerm
-
-			if reply.Term > rfRef.currentTerm {
-				DPrintf(dElec, "S%v(T%v, %v) <- S%v(T%v) Discovered New Term\n", rfRef.me, rfRef.currentTerm, rfRef.currentState.ToString(), peerId, reply.Term)
-				// discover server with more recent term, it cannot be a candidate because its election term expired
-				rfRef.currentState = PeerFollower
-				rfRef.currentTerm = reply.Term
-				rfRef.votedFor = -1                  // now vote in another term
-				rfRef.condElectionResult.Broadcast() // end expired elections (if exists)
-				return
-			}
-			if reply.VoteGranted {
-				*ballet += 1
-				DPrintf(dElec, "S%v(T%v, %v) <- S%v(T%v) Got Vote. %v/%v\n", rfRef.me, rfRef.currentTerm, rfRef.currentState.ToString(), peerId,
-					reply.Term, *ballet, rfRef.majorityCnt())
-				// the server may already become a leader by now, so we ignore the vote results
-				if rfRef.currentState == PeerCandidate &&
-					*ballet >= rfRef.majorityCnt() {
-					// majority
-					rfRef.currentState = PeerLeader
-					rfRef.condElectionResult.Broadcast() // won the election
-				}
-			}
-		}(rf, &ballet, peerId, peer, rf.currentTerm)
+		go rf.collectVote(&ballet, peerId, peer, rf.currentTerm)
 	}
 
-	// wait for result
-	DPrintf(dElec, "S%v(T%v, %v) Wait Result", rf.me, rf.currentTerm, rf.currentState.ToString())
+	//DPrintf(dElec, "S%v(T%v, %v) Wait Result", rf.me, rf.currentTerm, rf.currentState.ToString())	// race read
 	rf.condElectionResult.Wait() // releases the mutex, require one when woken up
 	DPrintf(dElec, "S%v(T%v, %v) Election Ended state: %v\n", rf.me, rf.currentTerm, rf.currentState.ToString(), rf.currentState.ToString())
+}
+
+func (rf *Raft) collectVote(ballet *int, peerId int, localPeer *labrpc.ClientEnd, localTerm int) {
+	//DPrintf(dElec, "S%v(T%v, %v) -> S%v(T%v) Ask Vote\n", rf.me, rf.currentTerm, rf.currentState.ToString(), peerId, localTerm)	// race read
+	reply := RequestVoteReply{}
+	// cannot use mutating rfRef.* without mutex
+	if !localPeer.Call("Raft.RequestVote", &RequestVoteArgs{
+		Term:         localTerm,
+		CandidateId:  rf.me, // this field is assumed constant
+		LastLogIndex: 0,
+		LastLogTerm:  0,
+	}, &reply) {
+		// no reply from the client, retrying?
+		return
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if localTerm != rf.currentTerm {
+		// maybe this is an obsolete vote reply for the previous election
+		return
+	}
+	// localTerm = rf.currentTerm
+
+	if rf.currentTerm < reply.Term {
+		DPrintf(dElec, "S%v(T%v, %v) <- S%v(T%v) Discovered New Term\n", rf.me, rf.currentTerm, rf.currentState.ToString(), peerId, reply.Term)
+		// discover server with more recent term, it cannot be a candidate because its election term expired
+		rf.stepDown(reply.Term)
+		return
+	}
+
+	// rf.currentTerm >= reply.Term
+	if reply.VoteGranted {
+		*ballet += 1
+		DPrintf(dElec, "S%v(T%v, %v) <- S%v(T%v) Got Vote. %v/%v\n", rf.me, rf.currentTerm, rf.currentState.ToString(), peerId,
+			reply.Term, *ballet, rf.majorityCnt())
+		// the server may already become a leader by now, so we ignore the vote results
+		if rf.currentState == PeerCandidate && *ballet >= rf.majorityCnt() {
+			rf.currentState = PeerLeader
+			rf.condElectionResult.Broadcast() // won the election
+		}
+	}
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -86,48 +82,44 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	DPrintf(dVote, "S%v(T%v, %v) <- S%v(T%v) Request Vote\n", rf.me, rf.currentTerm, rf.currentState.ToString(), args.CandidateId, args.Term)
 	defer rf.mu.Unlock()
 
-	if args.Term > rf.currentTerm {
-		DPrintf(dVote, "S%v: T%v > T%v Update\n", rf.me, args.Term, rf.currentTerm)
-		rf.currentTerm = args.Term
-		rf.currentState = PeerFollower // stale term candidate or leader step down
-		rf.votedFor = -1               // clear their vote
-		rf.condElectionResult.Broadcast()
-		// TODO(jens): any initialisations?
+	// NOTE: When a disconnected leader rejoins the cluster, it may have the same term as the current leader
+	// since they both re-elect in parallel and can have possibly the same term number.
+	// But the current leader has already voted for itself and will not vote for it, so no need to handle this case
+
+	if rf.currentTerm < args.Term {
+		DPrintf(dVote, "S%v(T%v) Discovers New Term T%v\n", rf.me, args.Term, rf.currentTerm)
+		rf.stepDown(args.Term)
 	}
 
-	// now currentTerm >= term
+	// currentTerm >= term
 
 	// TODO(jens): persistent
-	if rf.currentState == PeerLeader {
-		// when a disconnected leader rejoins the cluster, it may have the same term as the candidate
-		// since they both re-elect in parallel and can have possibly the same term number
-		DPrintf(dVote, "S%v(T%v, %v) leader cannot be asked to vote for S%v(T%v)\n", rf.me, rf.currentTerm, rf.currentState.ToString(),
-			args.CandidateId, args.Term)
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = false
-		return
-	}
 
 	if rf.currentState == PeerCandidate && rf.votedFor != rf.me {
 		panic("candidate cannot vote for others")
 	}
 
-	if args.Term < rf.currentTerm {
-		// leader from the previous elections
-		DPrintf(dVote, "S%v(T%v, %v) -> S%v(T%v) Reject\n", rf.me, args.CandidateId, args.Term, rf.currentTerm)
+	if rf.currentTerm > args.Term {
+		// candidate from the previous elections
+		DPrintf(dVote, "S%v(T%v, %v) -> S%v(T%v) Reject Vote\n", rf.me, args.CandidateId, args.Term, rf.currentTerm)
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
 	}
+
+	// currentTerm = args.Term
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		// the second check is for lost reply and the candidate resend the request
 		// TODO(jens): check for candidate log
 		DPrintf(dVote, "S%v(T%v, %v) -> S%v(T%v) Grant Vote\n", rf.me, rf.currentTerm, rf.currentState.ToString(), args.CandidateId, rf.currentTerm)
+		// vote for the candidate
 		rf.votedFor = args.CandidateId
+
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
-		// GRANTED a vote to a candidate, reset timer
-		rf.delta += 1
-		DPrintf(dAppd, "S%v(T%v, %v) Reset Timer\n", rf.me, rf.currentTerm, rf.currentState.ToString())
+
+		// GRANTED a vote to a candidate, election progress, reset timer
+		rf.resetElectionTimer()
 		return
 	}
 	DPrintf(dVote, "S%v(T%v, %v) -> S%v(T%v) Ignore\n", rf.me, rf.currentTerm, rf.currentState.ToString(), args.CandidateId, args.Term)
@@ -142,45 +134,42 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.ServerId = rf.me // debug
 	DPrintf(dAppd, "S%v(T%v, %v) <- S%v(T%v)\n", rf.me, rf.currentTerm, rf.currentState.ToString(), args.LeaderId, args.Term)
 
-	// if a stale leader of more recent term sends a request, we accept it but it won't receive the majority
+	if rf.currentState == PeerLeader && rf.currentTerm == args.Term {
+		panic("Raft::AppendEntries, two leaders")
+	}
+
+	// if a stale leader of more recent term sends a request, we accept it, but it won't receive the majority
 	// ack and won't commit.
 	// case: maybe the server is just online, and this is the first it received, it cannot distinguish
 	// the "leaders" since they all have more recent terms.
 
-	if rf.currentState == PeerLeader && rf.currentTerm == args.Term {
-		panic("two leaders???")
-	}
-
-	if rf.currentTerm <= args.Term {
-		// RECEIVED a request from the (more) current leader. can still be stale
-		rf.delta += 1 // reset timer by updating it
-		DPrintf(dAppd, "S%v(T%v, %v) Reset Timer\n", rf.me, rf.currentTerm, rf.currentState.ToString())
-	}
-
-	if rf.currentTerm == args.Term {
-		DPrintf(dAppd, "S%v(T%v, %v) Discovered Leader S%v(T%v), Step Down\n", rf.me, rf.currentTerm, rf.currentState.ToString(), args.LeaderId, args.Term)
-		rf.currentState = PeerFollower
-		rf.votedFor = args.LeaderId
-	}
-
-	// sync with higher term
 	if rf.currentTerm < args.Term {
-		// a (more recent, maybe stale) leader has sent a request
-		DPrintf(dAppd, "S%v(T%v, %v) Update to T%v\n", rf.me, rf.currentTerm, rf.currentState.ToString(), args.Term)
-		rf.currentTerm = args.Term
-		// follow and vote for that leader as if it won the election
-		// and the server is catching up with the majority decision
-		rf.currentState = PeerFollower
+		// a (more recent, maybe stale) leader has sent a request this rf maybe a stale
+		// leader or candidate, and would step down as follower for the new term
+		DPrintf(dAppd, "S%v(T%v, %v) Discovers New Term T%v\n", rf.me, rf.currentTerm, rf.currentState.ToString(), args.Term)
+		rf.stepDown(args.Term)
+		// Should set voteFor, because there may be other stale leaders running for the same term as the sender
+		// after they are reconnected to the cluster.
+		// It should not vote for them when called by RequestVote because it follows the current leader
 		rf.votedFor = args.LeaderId
-		rf.condElectionResult.Broadcast()
 	}
 
-	if args.Term < rf.currentTerm {
-		DPrintf(dAppd, "S%v(T%v, %v) -> S%v(T%v) Reject\n", rf.me, rf.currentTerm, rf.currentState.ToString(), args.LeaderId, args.Term)
+	// currentTerm >= args.Term
+
+	if rf.currentTerm > args.Term {
+		// reject stale leader for log sync
+		DPrintf(dAppd, "S%v(T%v, %v) -> S%v(T%v) Reject Log Sync\n",
+			rf.me, rf.currentTerm, rf.currentState.ToString(), args.LeaderId, args.Term)
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
+
+	// currentTerm = args.Term
+
+	rf.currentState = PeerFollower // Candidate may step down for the elected leader
+	rf.votedFor = args.LeaderId
+	rf.resetElectionTimer() // progress
 
 	if len(args.Entires) == 0 {
 		DPrintf(dAppd, "S%v(T%v, %v) -> S%v(T%v) Confirm Heartbeat\n", rf.me, rf.currentTerm, rf.currentState.ToString(), args.LeaderId, args.Term)
@@ -219,7 +208,7 @@ func (rf *Raft) heartbeat() {
 
 				rfRef.mu.Lock()
 				defer rfRef.mu.Unlock()
-				DPrintf(dAppd, "S%v(T%v, %v) <- S%v(T%v)\n", rf.me, rf.currentTerm, rf.currentState.ToString(), reply.ServerId, reply.Term)
+				DPrintf(dAppd, "S%v(T%v, %v) <- S%v(T%v) AppendEntries Reply\n", rf.me, rf.currentTerm, rf.currentState.ToString(), reply.ServerId, reply.Term)
 
 				if currentTerm < rfRef.currentTerm {
 					// we ignore stale response
@@ -230,11 +219,8 @@ func (rf *Raft) heartbeat() {
 					if reply.Success {
 						panic("servers should never accept AppendEntries from stale leader")
 					}
-					DPrintf(dVote, "S%v: T%v > T%v Update\n", rf.me, reply.Term, rf.currentTerm)
-					rf.currentTerm = reply.Term
-					rf.currentState = PeerFollower // stale leader steps down
-					rf.votedFor = -1               // clear their vote
-					rf.condElectionResult.Broadcast()
+					DPrintf(dAppd, "S%v(T%v) Discovers New Term T%v\n", rf.me, reply.Term, rf.currentTerm)
+					rf.stepDown(reply.Term)
 				}
 
 			}(rf, peer, peerId, rf.currentTerm)
@@ -252,6 +238,26 @@ func (rf *Raft) majorityCnt() int {
 
 func electionTimeout() time.Duration {
 	return time.Duration(50+(rand.Int63()%300)) * time.Millisecond
+}
+
+func (rf *Raft) stepDown(term int) {
+	if rf.mu.TryLock() {
+		panic("Raft::stepDown: the caller must hold the lock before entering")
+	}
+	// step down as the follower of the more recent term
+	rf.currentTerm = term
+	rf.currentState = PeerFollower
+	rf.votedFor = -1
+	rf.condElectionResult.Broadcast() // end stale elections
+	rf.resetElectionTimer()           // it finds a more recent term, progress
+}
+
+func (rf *Raft) resetElectionTimer() {
+	if rf.mu.TryLock() {
+		panic("Raft::resetElectionTimer: the caller must hold the lock before entering")
+	}
+	rf.delta += 1
+	DPrintf(dTimr, "S%v(T%v, %v) Reset Timer\n", rf.me, rf.currentTerm, rf.currentState.ToString())
 }
 
 type RequestVoteArgs struct {
