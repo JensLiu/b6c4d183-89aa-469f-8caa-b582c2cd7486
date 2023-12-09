@@ -68,6 +68,11 @@ func (t PeerType) ToString() string {
 	}
 }
 
+type LogEntry struct {
+	Term int
+	Cmd  interface{}
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -79,12 +84,12 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	applyCh      chan ApplyMsg
 	currentState PeerType
 
 	currentTerm int
 	votedFor    int
-	log         []ApplyMsg
+	log         []LogEntry
 	commitIndex int
 	lastApplied int
 
@@ -204,13 +209,26 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
 
-	return index, term, isLeader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.currentState != PeerLeader {
+		return rf.commitIndex, rf.currentTerm, false
+	}
+
+	ServerPrintf(dReplicate, rf, "START: %v\n", command)
+
+	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Cmd: command})
+
+	go func() {
+		rf.mu.Lock()
+		rf.replicateLogs()
+		rf.mu.Unlock()
+	}()
+
+	return len(rf.log) - 1, rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -246,12 +264,15 @@ func (rf *Raft) ticker() {
 
 		rf.mu.Lock()
 		if prevRequestCnt == rf.delta && rf.currentState != PeerLeader {
-			DPrintf(dTimr, "S%v(T%v) Election timeout\n", rf.me, rf.currentTerm)
+			ServerPrintf(dTimer, rf, "Election timeout\n")
 			// non-blocking election so that the election timeout can kick off
 			go func() { // lock held
 				rf.startElection() // lock held on return, released on wait
 				if rf.currentState == PeerLeader {
-					// TODO(jens): in lab2B, initialise nextIndex, matchIndex
+					for peerId := range rf.peers {
+						rf.nextIndex[peerId] = max(len(rf.log), 1)
+						rf.matchIndex[peerId] = 0
+					}
 					go rf.heartbeat()
 				}
 				rf.mu.Unlock()
@@ -260,10 +281,10 @@ func (rf *Raft) ticker() {
 			prevRequestCnt = rf.delta
 			rf.mu.Unlock()
 		}
-		//DPrintf(dTimr, "S%v(T%v) -> timer", rf.me, rf.currentTerm)	// race read
+		ServerRacePrintf(dTimer, rf, "-> timer")
 		time.Sleep(electionTimeout())
 		rf.condElectionResult.Broadcast() // force stop elections
-		//DPrintf(dTimr, "S%v(T%v) <- timer", rf.me, rf.currentTerm)	// race read
+		ServerRacePrintf(dTimer, rf, "<- timer")
 	}
 }
 
@@ -284,10 +305,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.applyCh = applyCh
 	rf.currentState = PeerFollower
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.log = make([]ApplyMsg, 0)
+	rf.log = []LogEntry{{
+		Term: 0,
+	}}
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.nextIndex = make(map[int]int)

@@ -12,11 +12,13 @@ import (
 type logTopic string
 
 const (
-	dNetw = "NETW"
-	dElec = "ELEC"
-	dVote = "VOTE"
-	dAppd = "APPD"
-	dTimr = "TIMR"
+	dNetwork   = "NETW"
+	dElection  = "ELEC"
+	dAppend    = "APPD"
+	dTimer     = "TIMR"
+	dReplicate = "REPL"
+	dCommit    = "CMIT"
+	dApply     = "APPL"
 )
 
 var debugStart time.Time
@@ -24,11 +26,12 @@ var debugVerbosity int
 
 func init() {
 	debugVerbosity = getVerbosity()
+	//debugVerbosity = 1
 	debugStart = time.Now()
 	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 }
 
-func DPrintf(topic logTopic, format string, a ...interface{}) {
+func RawPrintf(topic logTopic, format string, a ...interface{}) {
 	if debugVerbosity >= 1 {
 		time := time.Since(debugStart).Microseconds()
 		time /= 100
@@ -36,6 +39,22 @@ func DPrintf(topic logTopic, format string, a ...interface{}) {
 		format = prefix + format
 		log.Printf(format, a...)
 	}
+}
+
+func ServerPrintf(topic logTopic, rf *Raft, format string, a ...interface{}) {
+	args := []interface{}{
+		rf.me, rf.currentTerm, rf.currentState.ToString(),
+	}
+	args = append(args, a...)
+	RawPrintf(topic, "S%v(T%v, %v) "+format, args...)
+}
+
+func ServerRacePrintf(topic logTopic, rf *Raft, format string, a ...interface{}) {
+	args := []interface{}{
+		rf.me,
+	}
+	args = append(args, a...)
+	RawPrintf(topic, "S%v(...) "+format, args...)
 }
 
 func getVerbosity() int {
