@@ -69,8 +69,9 @@ func (t PeerType) ToString() string {
 }
 
 type LogEntry struct {
-	Term int
-	Cmd  interface{}
+	Index int
+	Term  int
+	Cmd   interface{}
 }
 
 // Log as an object
@@ -96,7 +97,7 @@ func (log *Log) Append(entries ...LogEntry) int {
 
 	for _, ent := range entries {
 		if _, ok := log.termIdx[ent.Term]; !ok {
-			log.termIdx[ent.Term] = ent.Term
+			log.termIdx[ent.Term] = ent.Index
 			//fmt.Printf("%v\n", log.termIdx)
 		}
 	}
@@ -124,8 +125,10 @@ func (log *Log) Len() int {
 	return len(log.entries) + log.inMemIdx
 }
 
-func (log *Log) FallBackIdx() int {
-	return log.termIdx[log.Len()-1]
+func (log *Log) FallBack() (index, term int) {
+	term = log.entries[log.Len()-1].Term
+	index = log.termIdx[term]
+	return
 }
 
 // A Go object implementing a single Raft peer.
@@ -275,7 +278,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	ServerPrintf(dReplicate, rf, "START: %v\n", command)
 
-	rf.log.Append(LogEntry{Term: rf.currentTerm, Cmd: command})
+	rf.log.Append(LogEntry{Index: rf.log.Len(), Term: rf.currentTerm, Cmd: command})
 
 	rf.replicateLogs(nil)
 
@@ -362,7 +365,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.log = Log{
 		inMemIdx: 0,
-		entries:  []LogEntry{{0, ""}},
+		entries:  []LogEntry{{0, 0, ""}},
 		termIdx:  map[int]int{0: 0},
 	}
 	rf.commitIndex = 0

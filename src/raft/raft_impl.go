@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"slices"
 	"sync"
 	"time"
 )
@@ -202,6 +203,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		ServerPrintf(dAppend, rf, "Failed Integrity Check\n")
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		reply.FallbackIndex, reply.FallbackTerm = rf.log.FallBack()
 		return
 	}
 
@@ -249,7 +251,12 @@ func (rf *Raft) logConsistencyCheck(args *AppendEntriesArgs) bool {
 
 	if args.LeaderCommit > rf.commitIndex {
 		ServerPrintf(dAppend, rf, "args.LeaderCommit > rf.commitIndex")
-		// if indexOf(LastLogTheLeaderSends) < leaderCommit, we may end up committing stale entries??
+
+		if args.PrevLogIndex+len(args.Entries) < args.LeaderCommit {
+			// if indexOf(LastLogTheLeaderSends) < leaderCommit, we may end up committing stale entries??
+			panic("may commit stale entry?")
+		}
+
 		rf.commitIndex = min(args.LeaderCommit, rf.LastLogIdx())
 	}
 
@@ -371,10 +378,16 @@ func (rf *Raft) askToReplicate(peerId int, peer *labrpc.ClientEnd, condWait *syn
 		}
 		return
 	}
-	rf.handleStaleFollower(peerId, &reply)
+
+	if rf.nextIndex[peerId] == beginLogIdx {
+		rf.handleStaleFollowerFaster(peerId, &reply)
+		return
+	} else {
+		// otherwise, the index has been changed by another request; we should not overwrite it
+		ServerPrintf(dAppend, rf, "stale reply for fallback\n")
+	}
 
 }
-
 func (rf *Raft) handleStaleFollower(peerId int, reply *AppendEntriesReply) {
 	if rf.mu.TryLock() {
 		panic("Raft::handleStaleFollower: the caller should hold the lock")
@@ -383,6 +396,39 @@ func (rf *Raft) handleStaleFollower(peerId int, reply *AppendEntriesReply) {
 	ServerPrintf(dReplicate, rf, "State %v\n", rf.ToString())
 	rf.nextIndex[peerId] = max(1, nextIdx)
 	ServerPrintf(dReplicate, rf, "Slow Follower %v\n", peerId)
+}
+
+func (rf *Raft) handleStaleFollowerFaster(peerId int, reply *AppendEntriesReply) {
+	if rf.mu.TryLock() {
+		panic("Raft::handleStaleFollower: the caller should hold the lock")
+	}
+
+	from := rf.nextIndex[peerId]
+
+	if _, ok := rf.log.termIdx[reply.FallbackTerm]; !ok {
+		// stale term from follower that is ignored by the system
+		// we find the term just one less than the stale term
+		keys := make([]int, len(rf.log.termIdx))
+		for key := range rf.log.termIdx {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		i, found := slices.BinarySearch(keys, reply.FallbackTerm)
+		if !found {
+			i -= 1
+		}
+		rf.nextIndex[peerId] = rf.log.termIdx[keys[i]]
+	}
+	if rf.log.At(reply.FallbackIndex).Term == reply.FallbackTerm {
+		// the prefix matches, we should fast-forward to this point rather than -1 everytime
+		rf.nextIndex[peerId] = reply.FallbackIndex
+	} else {
+		panic("does not found in the log")
+	}
+
+	to := rf.nextIndex[peerId]
+
+	ServerPrintf(dAppend, rf, "nextIndex[%v]: %v -> %v\n", peerId, from, to)
 }
 
 func (rf *Raft) applyLog() {
@@ -473,8 +519,8 @@ func (rf *Raft) resetElectionTimer() {
 
 func (rf *Raft) ToString() string {
 	return fmt.Sprintf("currentTerm=%v, votedFor=%v, committedIndex=%v, "+
-		"lastApplied=%v, nextIndex=%v, matchIndex=%v", rf.currentTerm, rf.votedFor,
-		rf.commitIndex, rf.lastApplied, rf.nextIndex, rf.matchIndex)
+		"lastApplied=%v, nextIndex=%v, matchIndex=%v, log=%v", rf.currentTerm, rf.votedFor,
+		rf.commitIndex, rf.lastApplied, rf.nextIndex, rf.matchIndex, rf.log)
 	//return ""
 }
 
@@ -510,7 +556,9 @@ func (args *AppendEntriesArgs) ToString() string {
 }
 
 type AppendEntriesReply struct {
-	Term     int  // for stale leaders to update themselves
-	Success  bool // if the follower passes the validation check
-	ServerId int  // for debug reasons
+	Term          int  // for stale leaders to update themselves
+	Success       bool // if the follower passes the validation check
+	ServerId      int  // for debug reasons
+	FallbackIndex int  // for fast follower log correction
+	FallbackTerm  int  // for fast follower log correction
 }
