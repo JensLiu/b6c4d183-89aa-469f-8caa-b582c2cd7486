@@ -73,6 +73,61 @@ type LogEntry struct {
 	Cmd  interface{}
 }
 
+// Log as an object
+type Log struct {
+	inMemIdx int
+	entries  []LogEntry
+	termIdx  map[int]int
+}
+
+func (log *Log) At(index int) *LogEntry {
+	if index >= log.inMemIdx+len(log.entries) {
+		return nil
+	}
+	if index < log.inMemIdx {
+		return nil
+	}
+	return &log.entries[index-log.inMemIdx]
+}
+
+func (log *Log) Append(entries ...LogEntry) int {
+	beginIdx := len(log.entries)
+	log.entries = append(log.entries, entries...)
+
+	for _, ent := range entries {
+		if _, ok := log.termIdx[ent.Term]; !ok {
+			log.termIdx[ent.Term] = ent.Term
+			//fmt.Printf("%v\n", log.termIdx)
+		}
+	}
+
+	return beginIdx
+}
+
+func (log *Log) SubLog(begin, end int) []LogEntry {
+	idx0 := begin - log.inMemIdx
+	idx1 := end - log.inMemIdx
+	if begin == -1 {
+		return log.entries[:idx1]
+	}
+	if end == -1 {
+		return log.entries[idx0:]
+	}
+	return log.entries[idx0:idx1]
+}
+
+func (log *Log) AsSubLog(begin, end int) {
+	log.entries = log.SubLog(begin, end)
+}
+
+func (log *Log) Len() int {
+	return len(log.entries) + log.inMemIdx
+}
+
+func (log *Log) FallBackIdx() int {
+	return log.termIdx[log.Len()-1]
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -89,7 +144,7 @@ type Raft struct {
 
 	currentTerm int
 	votedFor    int
-	log         []LogEntry
+	log         Log
 	commitIndex int
 	lastApplied int
 
@@ -220,15 +275,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	ServerPrintf(dReplicate, rf, "START: %v\n", command)
 
-	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Cmd: command})
+	rf.log.Append(LogEntry{Term: rf.currentTerm, Cmd: command})
 
-	go func() {
-		rf.mu.Lock()
-		rf.replicateLogs()
-		rf.mu.Unlock()
-	}()
+	rf.replicateLogs(nil)
 
-	return len(rf.log) - 1, rf.currentTerm, true
+	return rf.LastLogIdx(), rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -266,17 +317,17 @@ func (rf *Raft) ticker() {
 		if prevRequestCnt == rf.delta && rf.currentState != PeerLeader {
 			ServerPrintf(dTimer, rf, "Election timeout\n")
 			// non-blocking election so that the election timeout can kick off
-			go func() { // lock held
+			go func(rf *Raft) { // lock held
 				rf.startElection() // lock held on return, released on wait
 				if rf.currentState == PeerLeader {
 					for peerId := range rf.peers {
-						rf.nextIndex[peerId] = max(len(rf.log), 1)
+						rf.nextIndex[peerId] = max(rf.log.Len(), 1)
 						rf.matchIndex[peerId] = 0
 					}
 					go rf.heartbeat()
 				}
 				rf.mu.Unlock()
-			}()
+			}(rf)
 		} else {
 			prevRequestCnt = rf.delta
 			rf.mu.Unlock()
@@ -309,9 +360,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentState = PeerFollower
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.log = []LogEntry{{
-		Term: 0,
-	}}
+	rf.log = Log{
+		inMemIdx: 0,
+		entries:  []LogEntry{{0, ""}},
+		termIdx:  map[int]int{0: 0},
+	}
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.nextIndex = make(map[int]int)

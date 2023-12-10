@@ -6,7 +6,6 @@ import (
 	"math"
 	"math/rand"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -26,11 +25,11 @@ func (rf *Raft) startElection() {
 	ServerPrintf(dElection, rf, "Started election\n")
 
 	// ask for votes
-	for peerId, peer := range rf.peers {
+	for peerId := range rf.peers {
 		if peerId == rf.me {
 			continue
 		}
-		go rf.collectVote(&ballot, peerId, peer, rf.currentTerm)
+		go rf.collectVote(&ballot, peerId)
 	}
 
 	//DPrintf(dElec, "S%v(T%v, %v) Wait Result", rf.me, rf.currentTerm, rf.currentState.ToString())	// race read
@@ -38,13 +37,15 @@ func (rf *Raft) startElection() {
 	ServerPrintf(dElection, rf, "Election Ended state: %v\n", rf.currentState.ToString())
 }
 
-func (rf *Raft) collectVote(ballot *int, peerId int, localPeer *labrpc.ClientEnd, localTerm int) {
-	ServerRacePrintf(dElection, rf, "-> S%v(T%v) Ask Vote\n", peerId, localTerm) // race read
+func (rf *Raft) collectVote(ballot *int, peerId int) {
+	ServerRacePrintf(dElection, rf, "-> S%v Ask Vote\n", peerId) // race read
 	reply := RequestVoteReply{}
 
 	rf.mu.Lock()
-	lastLogIdx := len(rf.log) - 1
-	lastLogTerm := rf.log[lastLogIdx].Term
+	localTerm := rf.currentTerm
+	localPeer := rf.peers[peerId]
+	lastLogIdx := rf.LastLogIdx()
+	lastLogTerm := rf.log.At(lastLogIdx).Term
 	rf.mu.Unlock()
 
 	if !localPeer.Call("Raft.RequestVote", &RequestVoteArgs{
@@ -171,7 +172,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.currentTerm < args.Term {
 		// a (more recent, maybe stale) leader has sent a request this rf maybe a stale
 		// leader or candidate, and would step down as follower for the new term
-		ServerPrintf(dAppend, rf, "Discovers New Term T%v\n", reply.Term)
+		ServerPrintf(dAppend, rf, "Discovers New Term T%v\n", args.Term)
 		rf.stepDown(args.Term)
 		// Should set voteFor, because there may be other stale leaders running for the same term as the sender
 		// after they are reconnected to the cluster.
@@ -219,7 +220,7 @@ func (rf *Raft) logConsistencyCheck(args *AppendEntriesArgs) bool {
 	}
 
 	// prevLogIdx <= lastLogIdx
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if rf.log.At(args.PrevLogIndex).Term != args.PrevLogTerm {
 		ServerPrintf(dAppend, rf, "rf.log[args.PrevLogIndex].Term != args.PrevLogTerm\n")
 		return false
 	}
@@ -229,22 +230,26 @@ func (rf *Raft) logConsistencyCheck(args *AppendEntriesArgs) bool {
 	baseIdx := args.PrevLogIndex + 1
 	for i, ent := range args.Entries {
 		idx := baseIdx + i
-		if idx > rf.LastLogIdx() || rf.log[idx].Term != ent.Term {
-			// conflicting term, remove logs after that
-			rf.log = rf.log[:idx]
+		if idx > rf.LastLogIdx() || rf.log.At(idx).Term != ent.Term {
+			// remove entries after the conflicting term
+			rf.log.AsSubLog(-1, idx)
 			diffIdx = idx
 			break
 		}
 	}
 
+	// it may be the case that no entries conflict with the request, but
+	// entries after entries the leader sends are stale
+
 	// apply entries not already in the log
 	if diffIdx != -1 {
 		ServerPrintf(dAppend, rf, "diffIdx = %v\n", diffIdx)
-		rf.log = append(rf.log, args.Entries[diffIdx-baseIdx:]...)
+		rf.log.Append(args.Entries[diffIdx-baseIdx:]...)
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
 		ServerPrintf(dAppend, rf, "args.LeaderCommit > rf.commitIndex")
+		// if indexOf(LastLogTheLeaderSends) < leaderCommit, we may end up committing stale entries??
 		rf.commitIndex = min(args.LeaderCommit, rf.LastLogIdx())
 	}
 
@@ -255,47 +260,34 @@ func (rf *Raft) logConsistencyCheck(args *AppendEntriesArgs) bool {
 
 // Log Replication Begin --------------------------------------------------------------------------
 
-func (rf *Raft) replicateLogs() bool {
+func (rf *Raft) replicateLogs(condWait *sync.Cond) {
 	if rf.mu.TryLock() {
 		panic("Raft::replicateLogs: the caller should hold the lock")
 	}
 
-	ackCnt := 1
-	condResult := sync.NewCond(&rf.mu)
 	idx := rf.LastLogIdx()
 
 	ServerRacePrintf(dReplicate, rf, "Start Replicate Logs until %v\n", idx)
 
-	committed := atomic.Bool{}
-	committed.Store(false)
 	for peerId, peer := range rf.peers {
 		if peerId == rf.me {
 			continue
 		}
-		go rf.askToReplicate(&ackCnt, peerId, peer, rf.currentTerm, condResult, &committed)
+		go rf.askToReplicate(peerId, peer, condWait)
 	}
-
-	condResult.Wait()
-
-	if committed.Load() {
-
-	} else {
-		ServerPrintf(dReplicate, rf, "Replicate Failed\n")
-	}
-
-	return committed.Load()
 }
 
-func (rf *Raft) askToReplicate(ackCnt *int, peerId int, peer *labrpc.ClientEnd, localTerm int,
-	condResult *sync.Cond, committed *atomic.Bool) {
+func (rf *Raft) askToReplicate(peerId int, peer *labrpc.ClientEnd, condWait *sync.Cond) {
 
 	reply := AppendEntriesReply{}
 
 	rf.mu.Lock()
-	//beginLogIdx := rf.nextIndex[peerId] // nextIdx[.] >= 1, log 0 is always committed
-	prevLogIdx := rf.matchIndex[peerId]
-	prevLogTerm := rf.log[prevLogIdx].Term
-	entries := rf.log[prevLogIdx+1:]
+	localTerm := rf.currentTerm
+	beginLogIdx := rf.nextIndex[peerId] // nextIdx[.] >= 1, log 0 is always committed
+	prevLogIdx := beginLogIdx - 1
+	//prevLogIdx := rf.matchIndex[peerId]
+	prevLogTerm := rf.log.At(prevLogIdx).Term
+	entries := rf.log.SubLog(prevLogIdx+1, -1)
 	leaderCommit := rf.commitIndex
 	args := AppendEntriesArgs{
 		Term:         localTerm,
@@ -317,7 +309,6 @@ func (rf *Raft) askToReplicate(ackCnt *int, peerId int, peer *labrpc.ClientEnd, 
 
 	// reply for previous term, ignore
 	if rf.currentTerm > localTerm {
-		condResult.Broadcast() // force stop
 		return
 	}
 
@@ -325,7 +316,6 @@ func (rf *Raft) askToReplicate(ackCnt *int, peerId int, peer *labrpc.ClientEnd, 
 	if reply.Term > rf.currentTerm {
 		ServerPrintf(dReplicate, rf, "Discovered new term %v\n", reply.Term)
 		rf.stepDown(reply.Term)
-		condResult.Broadcast()
 		return
 	}
 
@@ -341,13 +331,32 @@ func (rf *Raft) askToReplicate(ackCnt *int, peerId int, peer *labrpc.ClientEnd, 
 	// replyTerm = currentTerm
 
 	if reply.Success {
-		*ackCnt += 1
-		//ServerPrintf(dReplicate, rf, "<- S%v(T%v) Replicated %v/%v\n", reply.ServerId, reply.Term,
-		//	*ackCnt, rf.majorityCnt())
 		peerUpdatedLastIdx := prevLogIdx + len(entries)
 		rf.nextIndex[peerId] = max(rf.nextIndex[peerId], peerUpdatedLastIdx+1) // deal with stale reply
 		rf.matchIndex[peerId] = max(rf.matchIndex[peerId], peerUpdatedLastIdx)
-		if *ackCnt >= rf.majorityCnt() { // the majority stored the log
+
+		if rf.currentTerm != reply.Term {
+			return
+		}
+
+		// currentTerm = replyTerm
+		// only count majority for the current term to avoid reverted commit from previous terms if the leader
+		// crashes and the entry does not have a majority over {server...}\{leader} cluster
+
+		ackCnt := 1
+		for id := range rf.peers {
+			if id == rf.me {
+				continue
+			}
+			if rf.matchIndex[id] >= peerUpdatedLastIdx {
+				ackCnt += 1
+			}
+		}
+
+		ServerPrintf(dReplicate, rf, "<- S%v(T%v) Replicated %v/%v\n", reply.ServerId, reply.Term,
+			ackCnt, rf.majorityCnt())
+
+		if ackCnt >= rf.majorityCnt() { // the majority stored the log
 			if rf.commitIndex < peerUpdatedLastIdx {
 				rf.commitIndex = peerUpdatedLastIdx
 				ServerPrintf(dCommit, rf, "Committed\n")
@@ -356,8 +365,9 @@ func (rf *Raft) askToReplicate(ackCnt *int, peerId int, peer *labrpc.ClientEnd, 
 				ServerPrintf(dReplicate, rf, "Ignore Stale Reply\n")
 			}
 			ServerPrintf(dCommit, rf, "state: %v\n", rf.ToString())
-			committed.Store(true)
-			condResult.Broadcast()
+			if condWait != nil {
+				condWait.Broadcast()
+			}
 		}
 		return
 	}
@@ -388,14 +398,14 @@ func (rf *Raft) applyLog() {
 		// we apply as much as possible when called
 		rf.applyCh <- ApplyMsg{
 			CommandValid:  true,
-			Command:       rf.log[rf.lastApplied].Cmd,
+			Command:       rf.log.At(rf.lastApplied).Cmd,
 			CommandIndex:  rf.lastApplied,
 			SnapshotValid: false,
 			Snapshot:      nil,
 			SnapshotTerm:  0,
 			SnapshotIndex: 0,
 		}
-		ServerPrintf(dApply, rf, "Apply command %v, %v\n", rf.lastApplied, rf.log[rf.lastApplied])
+		ServerPrintf(dApply, rf, "Apply command %v, %v\n", rf.lastApplied, rf.log.At(rf.lastApplied))
 		rf.lastApplied += 1
 	}
 }
@@ -408,11 +418,7 @@ func (rf *Raft) heartbeat() {
 	ServerPrintf(dTimer, rf, "Heartbeat Start\n")
 
 	for rf.currentState == PeerLeader {
-		go func() {
-			rf.mu.Lock()
-			rf.replicateLogs()
-			rf.mu.Unlock()
-		}()
+		rf.replicateLogs(nil)
 		rf.mu.Unlock()
 		time.Sleep(rf.heartbeatDuration)
 		rf.mu.Lock()
@@ -447,7 +453,7 @@ func (rf *Raft) hasNewerLogThan(lastLogIdx1, lastLogTerm1 int) bool {
 		panic("Raft::hasNewerLog: caller should hold the lock")
 	}
 	lastLogIdx0 := rf.LastLogIdx()
-	lastLogTerm0 := rf.log[lastLogIdx0].Term
+	lastLogTerm0 := rf.log.At(lastLogIdx0).Term
 	ServerPrintf(dElection, rf,
 		"currentLastLogIdx=%v, currentLastLogTerm=%v, lastLogIdx=%v, lastLogTerm=%v\n",
 		lastLogIdx0, lastLogTerm0, lastLogIdx1, lastLogTerm1)
@@ -467,12 +473,13 @@ func (rf *Raft) resetElectionTimer() {
 
 func (rf *Raft) ToString() string {
 	return fmt.Sprintf("currentTerm=%v, votedFor=%v, committedIndex=%v, "+
-		"lastApplied=%v, Log=%v, nextIndex=%v, matchIndex=%v", rf.currentTerm, rf.votedFor,
-		rf.commitIndex, rf.lastApplied, rf.log, rf.nextIndex, rf.matchIndex)
+		"lastApplied=%v, nextIndex=%v, matchIndex=%v", rf.currentTerm, rf.votedFor,
+		rf.commitIndex, rf.lastApplied, rf.nextIndex, rf.matchIndex)
+	//return ""
 }
 
 func (rf *Raft) LastLogIdx() int {
-	return len(rf.log) - 1
+	return rf.log.Len() - 1
 }
 
 type RequestVoteArgs struct {
@@ -497,8 +504,8 @@ type AppendEntriesArgs struct {
 }
 
 func (args *AppendEntriesArgs) ToString() string {
-	return fmt.Sprintf("Term=%v, Leader=%v, PrevLogIndex=%v, PrevLogTerm=%v, LeaderCommit=%v, Entries=%v",
-		args.Term, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, args.Entries,
+	return fmt.Sprintf("Term=%v, Leader=%v, PrevLogIndex=%v, PrevLogTerm=%v, LeaderCommit=%v",
+		args.Term, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit,
 	)
 }
 
