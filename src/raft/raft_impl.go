@@ -289,6 +289,11 @@ func (rf *Raft) askToReplicate(peerId int, peer *labrpc.ClientEnd, condWait *syn
 	reply := AppendEntriesReply{}
 
 	rf.mu.Lock()
+	if rf.currentState != PeerLeader {
+		// avoid change of state between the function call and RPC call
+		rf.mu.Unlock()
+		return
+	}
 	localTerm := rf.currentTerm
 	beginLogIdx := rf.nextIndex[peerId] // nextIdx[.] >= 1, log 0 is always committed
 	prevLogIdx := beginLogIdx - 1
@@ -313,7 +318,6 @@ func (rf *Raft) askToReplicate(peerId int, peer *labrpc.ClientEnd, condWait *syn
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	ServerPrintf(dReplicate, rf, "<-S%v Reply: %v", reply.ServerId, reply)
-
 	// reply for previous term, ignore
 	if rf.currentTerm > localTerm {
 		return
@@ -415,7 +419,7 @@ func (rf *Raft) handleStaleFollowerFaster(peerId int, reply *AppendEntriesReply)
 		slices.Sort(keys)
 		i, found := slices.BinarySearch(keys, reply.FallbackTerm)
 		if !found {
-			i -= 1
+			i = max(1, i-1)
 		}
 		rf.nextIndex[peerId] = rf.log.termIdx[keys[i]]
 	}
