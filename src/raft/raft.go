@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -68,69 +70,6 @@ func (t PeerType) ToString() string {
 	}
 }
 
-type LogEntry struct {
-	Index int
-	Term  int
-	Cmd   interface{}
-}
-
-// Log as an object
-type Log struct {
-	inMemIdx int
-	entries  []LogEntry
-	termIdx  map[int]int
-}
-
-func (log *Log) At(index int) *LogEntry {
-	if index >= log.inMemIdx+len(log.entries) {
-		return nil
-	}
-	if index < log.inMemIdx {
-		return nil
-	}
-	return &log.entries[index-log.inMemIdx]
-}
-
-func (log *Log) Append(entries ...LogEntry) int {
-	beginIdx := len(log.entries)
-	log.entries = append(log.entries, entries...)
-
-	for _, ent := range entries {
-		if _, ok := log.termIdx[ent.Term]; !ok {
-			log.termIdx[ent.Term] = ent.Index
-			//fmt.Printf("%v\n", log.termIdx)
-		}
-	}
-
-	return beginIdx
-}
-
-func (log *Log) SubLog(begin, end int) []LogEntry {
-	idx0 := begin - log.inMemIdx
-	idx1 := end - log.inMemIdx
-	if begin == -1 {
-		return log.entries[:idx1]
-	}
-	if end == -1 {
-		return log.entries[idx0:]
-	}
-	return log.entries[idx0:idx1]
-}
-
-func (log *Log) AsSubLog(begin, end int) {
-	log.entries = log.SubLog(begin, end)
-}
-
-func (log *Log) Len() int {
-	return len(log.entries) + log.inMemIdx
-}
-
-func (log *Log) FallBack() (index, term int) {
-	term = log.entries[log.Len()-1].Term
-	index = log.termIdx[term]
-	return
-}
-
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -145,11 +84,11 @@ type Raft struct {
 	applyCh      chan ApplyMsg
 	currentState PeerType
 
-	currentTerm int
-	votedFor    int
-	log         Log
-	commitIndex int
-	lastApplied int
+	_currentTerm int
+	_votedFor    int
+	_log         Log
+	commitIndex  int
+	lastApplied  int
 
 	nextIndex  map[int]int // peerId -> index
 	matchIndex map[int]int // peerId -> index
@@ -159,6 +98,9 @@ type Raft struct {
 	condElectionResult *sync.Cond
 
 	heartbeatDuration time.Duration
+
+	// persistent
+	dirty atomic.Bool // if the persistent fields have been modified
 }
 
 // return currentTerm and whether this server
@@ -170,7 +112,7 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	term = rf.currentTerm
+	term = rf.getCurrentTerm()
 	isleader = rf.currentState == PeerLeader
 	return term, isleader
 }
@@ -184,13 +126,21 @@ func (rf *Raft) GetState() (int, bool) {
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	if rf.mu.TryLock() {
+		panic("Raft::persist: the caller must hole the lock")
+	}
+	if !rf.dirty.CompareAndSwap(true, false) {
+		return
+	}
+	ServerPrintf(dPersist, rf, "Persist: currentTerm=%v votedFor=%v logs=%v\n", rf._currentTerm, rf._votedFor,
+		rf._log)
+	writer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(writer)
+	encoder.Encode(rf._currentTerm)
+	encoder.Encode(rf._votedFor)
+	encoder.Encode(rf._log)
+	raftState := writer.Bytes()
+	rf.persister.Save(raftState, nil)
 }
 
 // restore previously persisted state.
@@ -198,19 +148,27 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	ServerPrintf(dPersist, rf, "Server Read Persist\n")
+
+	readBuffer := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(readBuffer)
+	var currentTerm int
+	var votedFor int
+	var log Log
+	if decoder.Decode(&currentTerm) != nil ||
+		decoder.Decode(&votedFor) != nil ||
+		decoder.Decode(&log) != nil {
+		panic("invalid decode")
+	}
+	rf._currentTerm = currentTerm
+	rf._votedFor = votedFor
+	rf._log = log
+	rf.dirty.Store(false)
+
 }
 
 // the service says it has created a snapshot that has
@@ -273,16 +231,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.mu.Unlock()
 
 	if rf.currentState != PeerLeader {
-		return rf.commitIndex, rf.currentTerm, false
+		return rf.commitIndex, rf.getCurrentTerm(), false
 	}
 
 	ServerPrintf(dReplicate, rf, "START: %v\n", command)
 
-	rf.log.Append(LogEntry{Index: rf.log.Len(), Term: rf.currentTerm, Cmd: command})
+	rf.AppendLogs(LogEntry{Index: rf.LogLen(), Term: rf.getCurrentTerm(), Cmd: command})
 
 	rf.replicateLogs(nil)
 
-	return rf.LastLogIdx(), rf.currentTerm, true
+	return rf.LastLogIdx(), rf.getCurrentTerm(), true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -308,14 +266,6 @@ func (rf *Raft) ticker() {
 	prevRequestCnt := 0
 	for rf.killed() == false {
 
-		// Your code here (2A)
-		// Check if a leader election should be started.
-
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		//ms := 50 + (rand.Int63() % 300)
-		//time.Sleep(time.Duration(ms) * time.Millisecond)
-
 		rf.mu.Lock()
 		if prevRequestCnt == rf.delta && rf.currentState != PeerLeader {
 			ServerPrintf(dTimer, rf, "Election timeout\n")
@@ -324,7 +274,7 @@ func (rf *Raft) ticker() {
 				rf.startElection() // lock held on return, released on wait
 				if rf.currentState == PeerLeader {
 					for peerId := range rf.peers {
-						rf.nextIndex[peerId] = max(rf.log.Len(), 1)
+						rf.nextIndex[peerId] = max(rf.LogLen(), 1)
 						rf.matchIndex[peerId] = 0
 					}
 					go rf.heartbeat()
@@ -361,12 +311,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.applyCh = applyCh
 	rf.currentState = PeerFollower
-	rf.currentTerm = 0
-	rf.votedFor = -1
-	rf.log = Log{
-		inMemIdx: 0,
-		entries:  []LogEntry{{0, 0, ""}},
-		termIdx:  map[int]int{0: 0},
+	rf._currentTerm = 0
+	rf._votedFor = -1
+	rf._log = Log{
+		InMemIdx: 0,
+		Entries:  []LogEntry{{0, 0, ""}},
+		TermIdx:  map[int]int{0: 0},
 	}
 	rf.commitIndex = 0
 	rf.lastApplied = 0

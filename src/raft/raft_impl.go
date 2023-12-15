@@ -18,13 +18,15 @@ func (rf *Raft) startElection() {
 	if rf.mu.TryLock() {
 		panic("the caller should hold mutex before entering the election period")
 	}
-	rf.currentTerm += 1
+
+	defer rf.persist()
+
+	rf.setCurrentTerm(rf.getCurrentTerm() + 1)
 	rf.currentState = PeerCandidate
 	rf.resetElectionTimer()
-	rf.votedFor = rf.me // vote for itself
+	rf.setVotedFor(rf.me) // vote for itself
 	ballot := 1
 	ServerPrintf(dElection, rf, "Started election\n")
-
 	// ask for votes
 	for peerId := range rf.peers {
 		if peerId == rf.me {
@@ -43,10 +45,10 @@ func (rf *Raft) collectVote(ballot *int, peerId int) {
 	reply := RequestVoteReply{}
 
 	rf.mu.Lock()
-	localTerm := rf.currentTerm
+	localTerm := rf.getCurrentTerm()
 	localPeer := rf.peers[peerId]
 	lastLogIdx := rf.LastLogIdx()
-	lastLogTerm := rf.log.At(lastLogIdx).Term
+	lastLogTerm := rf.LogAt(lastLogIdx).Term
 	rf.mu.Unlock()
 
 	if !localPeer.Call("Raft.RequestVote", &RequestVoteArgs{
@@ -62,7 +64,7 @@ func (rf *Raft) collectVote(ballot *int, peerId int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if localTerm != rf.currentTerm {
+	if localTerm != rf.getCurrentTerm() {
 		// Maybe this is an obsolete vote reply for the previous election
 		// the timer interrupt will eventually wake up the stale election thread.
 		// Do not wake up here since a stale vote can kill the current running election
@@ -70,10 +72,11 @@ func (rf *Raft) collectVote(ballot *int, peerId int) {
 	}
 
 	// localTerm = rf.currentTerm
-	if rf.currentTerm < reply.Term {
+	if rf.getCurrentTerm() < reply.Term {
 		ServerPrintf(dElection, rf, "<- S%v(T%v) Discovered New Term\n", rf.currentState.ToString(), peerId, reply.Term)
 		// discover server with more recent term, it cannot be a candidate because its election term expired
 		rf.stepDown(reply.Term)
+		rf.persist()
 		return
 	}
 
@@ -99,46 +102,43 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// since they both re-elect in parallel and can have possibly the same term number.
 	// But the current leader has already voted for itself and will not vote for it, so no need to handle this case
 
-	if rf.currentTerm < args.Term {
+	if rf.getCurrentTerm() < args.Term {
 		ServerPrintf(dElection, rf, "Discovers New Term T%v\n", reply.Term)
 		rf.stepDown(args.Term)
 	}
 
-	rf.applyLog() // apply log if possible
+	rf.applyLogs() // apply log if possible
 
 	// currentTerm >= term
 
-	// TODO(jens): persistent
-
-	if rf.currentState == PeerCandidate && rf.votedFor != rf.me {
+	if rf.currentState == PeerCandidate && rf.getVotedFor() != rf.me {
 		panic("candidate cannot vote for others")
 	}
 
-	if rf.currentTerm > args.Term {
+	if rf.getCurrentTerm() > args.Term {
 		// candidate from the previous elections
 		ServerPrintf(dElection, rf, "-> S%v(T%v) Reject Vote\n", args.CandidateId, args.Term)
-		reply.Term = rf.currentTerm
+		reply.Term = rf.getCurrentTerm()
 		reply.VoteGranted = false
 		return
 	}
 
 	// currentTerm = args.Term
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+	if rf.getVotedFor() == -1 || rf.getVotedFor() == args.CandidateId {
 		// the second check is for lost reply and the candidate resends the request
 
 		// check candidate log, should be at least as new as the server
 		if rf.hasNewerLogThan(args.LastLogIndex, args.LastLogTerm) {
 			ServerPrintf(dElection, rf, "-> S%v(%v) Reject, stale log\n", args.CandidateId, args.Term)
-			reply.Term = rf.currentTerm
+			reply.Term = rf.getCurrentTerm()
 			reply.VoteGranted = false
 			return
 		}
 
 		// vote for the candidate
-		ServerPrintf(dElection, rf, "-> S%v(T%v) Grant Vote\n", args.CandidateId, rf.currentTerm)
-		rf.votedFor = args.CandidateId
-
-		reply.Term = rf.currentTerm
+		ServerPrintf(dElection, rf, "-> S%v(T%v) Grant Vote\n", args.CandidateId, rf.getCurrentTerm())
+		rf.setVotedFor(args.CandidateId)
+		reply.Term = rf.getCurrentTerm()
 		reply.VoteGranted = true
 
 		// GRANTED a vote to a candidate, election progress, reset timer
@@ -146,7 +146,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	ServerPrintf(dElection, rf, "-> S%v(T%v) Ignore\n", args.CandidateId, args.Term)
-	reply.Term = rf.currentTerm
+	reply.Term = rf.getCurrentTerm()
 	reply.VoteGranted = false
 }
 
@@ -157,11 +157,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Only the current leader and the stale leaders can invoke
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	defer rf.persist()
+
 	reply.ServerId = rf.me // debug
 	ServerPrintf(dAppend, rf, "<- S%v(T%v) Args:%v\n", args.LeaderId, args.Term, args)
 	ServerPrintf(dAppend, rf, "State: %v\n", rf.ToString())
 
-	if rf.currentState == PeerLeader && rf.currentTerm == args.Term {
+	if rf.currentState == PeerLeader && rf.getCurrentTerm() == args.Term {
 		panic("Raft::AppendEntries, two leaders")
 	}
 
@@ -170,7 +173,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// case: maybe the server is just online, and this is the first it received, it cannot distinguish
 	// the "leaders" since they all have more recent terms.
 
-	if rf.currentTerm < args.Term {
+	if rf.getCurrentTerm() < args.Term {
 		// a (more recent, maybe stale) leader has sent a request this rf maybe a stale
 		// leader or candidate, and would step down as follower for the new term
 		ServerPrintf(dAppend, rf, "Discovers New Term T%v\n", args.Term)
@@ -178,17 +181,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// Should set voteFor, because there may be other stale leaders running for the same term as the sender
 		// after they are reconnected to the cluster.
 		// It should not vote for them when called by RequestVote because it follows the current leader
-		rf.votedFor = args.LeaderId
+		rf.setVotedFor(args.LeaderId)
 	}
 
-	rf.applyLog() // apply if possible
+	rf.applyLogs() // apply if possible
 
 	// currentTerm >= args.Term
 
-	if rf.currentTerm > args.Term {
+	if rf.getCurrentTerm() > args.Term {
 		// reject stale leader for log sync
 		ServerPrintf(dAppend, rf, "-> S%v(T%v) Reject Log Sync\n", args.LeaderId, args.Term)
-		reply.Term = rf.currentTerm
+		reply.Term = rf.getCurrentTerm()
 		reply.Success = false
 		return
 	}
@@ -196,20 +199,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// currentTerm = args.Term
 
 	rf.currentState = PeerFollower // Candidate may step down for the elected leader
-	rf.votedFor = args.LeaderId
+	rf.setVotedFor(args.LeaderId)
 	rf.resetElectionTimer() // progress
 
 	if !rf.logConsistencyCheck(args) {
 		ServerPrintf(dAppend, rf, "Failed Integrity Check\n")
-		reply.Term = rf.currentTerm
+		reply.Term = rf.getCurrentTerm()
 		reply.Success = false
-		reply.FallbackIndex, reply.FallbackTerm = rf.log.FallBack()
+		reply.FallbackIndex, reply.FallbackTerm = rf._log.FallBack()
 		return
 	}
 
 	ServerPrintf(dAppend, rf, "-> S%v(T%v) Accept\n", args.LeaderId, args.Term)
 	ServerPrintf(dAppend, rf, "State: %v\n", rf.ToString())
-	reply.Term = rf.currentTerm
+	reply.Term = rf.getCurrentTerm()
 	reply.Success = true
 }
 
@@ -222,7 +225,7 @@ func (rf *Raft) logConsistencyCheck(args *AppendEntriesArgs) bool {
 	}
 
 	// prevLogIdx <= lastLogIdx
-	if rf.log.At(args.PrevLogIndex).Term != args.PrevLogTerm {
+	if rf.LogAt(args.PrevLogIndex).Term != args.PrevLogTerm {
 		ServerPrintf(dAppend, rf, "rf.log[args.PrevLogIndex].Term != args.PrevLogTerm\n")
 		return false
 	}
@@ -232,9 +235,9 @@ func (rf *Raft) logConsistencyCheck(args *AppendEntriesArgs) bool {
 	baseIdx := args.PrevLogIndex + 1
 	for i, ent := range args.Entries {
 		idx := baseIdx + i
-		if idx > rf.LastLogIdx() || rf.log.At(idx).Term != ent.Term {
+		if idx > rf.LastLogIdx() || rf.LogAt(idx).Term != ent.Term {
 			// remove entries after the conflicting term
-			rf.log.AsSubLog(-1, idx)
+			rf.AsSubLog(-1, idx)
 			diffIdx = idx
 			break
 		}
@@ -246,7 +249,7 @@ func (rf *Raft) logConsistencyCheck(args *AppendEntriesArgs) bool {
 	// apply entries not already in the log
 	if diffIdx != -1 {
 		ServerPrintf(dAppend, rf, "diffIdx = %v\n", diffIdx)
-		rf.log.Append(args.Entries[diffIdx-baseIdx:]...)
+		rf.AppendLogs(args.Entries[diffIdx-baseIdx:]...)
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
@@ -272,6 +275,8 @@ func (rf *Raft) replicateLogs(condWait *sync.Cond) {
 		panic("Raft::replicateLogs: the caller should hold the lock")
 	}
 
+	defer rf.persist()
+
 	idx := rf.LastLogIdx()
 
 	ServerRacePrintf(dReplicate, rf, "Start Replicate Logs until %v\n", idx)
@@ -294,12 +299,12 @@ func (rf *Raft) askToReplicate(peerId int, peer *labrpc.ClientEnd, condWait *syn
 		rf.mu.Unlock()
 		return
 	}
-	localTerm := rf.currentTerm
-	beginLogIdx := rf.nextIndex[peerId] // nextIdx[.] >= 1, log 0 is always committed
+	localTerm := rf.getCurrentTerm()
+	beginLogIdx := max(rf.nextIndex[peerId], 1) // nextIdx[.] >= 1, log 0 is always committed
 	prevLogIdx := beginLogIdx - 1
 	//prevLogIdx := rf.matchIndex[peerId]
-	prevLogTerm := rf.log.At(prevLogIdx).Term
-	entries := rf.log.SubLog(prevLogIdx+1, -1)
+	prevLogTerm := rf.LogAt(prevLogIdx).Term
+	entries := rf.SubLog(prevLogIdx+1, -1)
 	leaderCommit := rf.commitIndex
 	args := AppendEntriesArgs{
 		Term:         localTerm,
@@ -319,18 +324,18 @@ func (rf *Raft) askToReplicate(peerId int, peer *labrpc.ClientEnd, condWait *syn
 	defer rf.mu.Unlock()
 	ServerPrintf(dReplicate, rf, "<-S%v Reply: %v", reply.ServerId, reply)
 	// reply for previous term, ignore
-	if rf.currentTerm > localTerm {
+	if rf.getCurrentTerm() > localTerm {
 		return
 	}
 
 	// discovers new term
-	if reply.Term > rf.currentTerm {
+	if reply.Term > rf.getCurrentTerm() {
 		ServerPrintf(dReplicate, rf, "Discovered new term %v\n", reply.Term)
 		rf.stepDown(reply.Term)
 		return
 	}
 
-	if reply.Term < rf.currentTerm {
+	if reply.Term < rf.getCurrentTerm() {
 		// the RPC API returns if it fails. distinguish this from a slow follower
 		if reply.Term != 0 {
 			panic("Raft::askToReplicate: reply term < current term\n")
@@ -346,7 +351,7 @@ func (rf *Raft) askToReplicate(peerId int, peer *labrpc.ClientEnd, condWait *syn
 		rf.nextIndex[peerId] = max(rf.nextIndex[peerId], peerUpdatedLastIdx+1) // deal with stale reply
 		rf.matchIndex[peerId] = max(rf.matchIndex[peerId], peerUpdatedLastIdx)
 
-		if rf.currentTerm != reply.Term {
+		if rf.getCurrentTerm() != reply.Term {
 			return
 		}
 
@@ -371,7 +376,7 @@ func (rf *Raft) askToReplicate(peerId int, peer *labrpc.ClientEnd, condWait *syn
 			if rf.commitIndex < peerUpdatedLastIdx {
 				rf.commitIndex = peerUpdatedLastIdx
 				ServerPrintf(dCommit, rf, "Committed\n")
-				rf.applyLog()
+				rf.applyLogs()
 			} else {
 				ServerPrintf(dReplicate, rf, "Ignore Stale Reply\n")
 			}
@@ -409,11 +414,12 @@ func (rf *Raft) handleStaleFollowerFaster(peerId int, reply *AppendEntriesReply)
 
 	from := rf.nextIndex[peerId]
 
-	if _, ok := rf.log.termIdx[reply.FallbackTerm]; !ok {
+	// bypass log dirty detection, since we do not modify log entries
+	if _, ok := rf._log.TermIdx[reply.FallbackTerm]; !ok {
 		// stale term from follower that is ignored by the system
 		// we find the term just one less than the stale term
-		keys := make([]int, len(rf.log.termIdx))
-		for key := range rf.log.termIdx {
+		keys := make([]int, len(rf._log.TermIdx))
+		for key := range rf._log.TermIdx {
 			keys = append(keys, key)
 		}
 		slices.Sort(keys)
@@ -421,13 +427,14 @@ func (rf *Raft) handleStaleFollowerFaster(peerId int, reply *AppendEntriesReply)
 		if !found {
 			i = max(1, i-1)
 		}
-		rf.nextIndex[peerId] = rf.log.termIdx[keys[i]]
+		rf.nextIndex[peerId] = rf._log.TermIdx[keys[i]]
 	}
-	if rf.log.At(reply.FallbackIndex).Term == reply.FallbackTerm {
+	if rf.LogAt(reply.FallbackIndex).Term == reply.FallbackTerm {
 		// the prefix matches, we should fast-forward to this point rather than -1 everytime
 		rf.nextIndex[peerId] = reply.FallbackIndex
 	} else {
-		panic("does not found in the log")
+		//panic("does not found in the log")
+		rf.nextIndex[peerId] = max(reply.FallbackIndex-1, 1)
 	}
 
 	to := rf.nextIndex[peerId]
@@ -435,12 +442,13 @@ func (rf *Raft) handleStaleFollowerFaster(peerId int, reply *AppendEntriesReply)
 	ServerPrintf(dAppend, rf, "nextIndex[%v]: %v -> %v\n", peerId, from, to)
 }
 
-func (rf *Raft) applyLog() {
+func (rf *Raft) applyLogs() int {
 	if rf.mu.TryLock() {
 		panic("Raft::applyLog: the caller should hold the lock")
 	}
 	// applied index is always at most equal to the commit index
 	// thus do not check for overflow
+	applied := 0
 	for rf.commitIndex >= rf.lastApplied {
 		// use `for` (not `if`)
 		// because the leader may ignore a stale commit message from its follower
@@ -448,16 +456,18 @@ func (rf *Raft) applyLog() {
 		// we apply as much as possible when called
 		rf.applyCh <- ApplyMsg{
 			CommandValid:  true,
-			Command:       rf.log.At(rf.lastApplied).Cmd,
+			Command:       rf.LogAt(rf.lastApplied).Cmd,
 			CommandIndex:  rf.lastApplied,
 			SnapshotValid: false,
 			Snapshot:      nil,
 			SnapshotTerm:  0,
 			SnapshotIndex: 0,
 		}
-		ServerPrintf(dApply, rf, "Apply command %v, %v\n", rf.lastApplied, rf.log.At(rf.lastApplied))
+		applied += 1
+		ServerPrintf(dApply, rf, "Apply command %v, %v\n", rf.lastApplied, rf.LogAt(rf.lastApplied))
 		rf.lastApplied += 1
 	}
+	return applied
 }
 
 // Log Replication End --------------------------------------------------------------------------
@@ -491,9 +501,9 @@ func (rf *Raft) stepDown(term int) {
 		panic("Raft::stepDown: the caller must hold the lock before entering")
 	}
 	// step down as the follower of the more recent term
-	rf.currentTerm = term
+	rf.setCurrentTerm(term)
 	rf.currentState = PeerFollower
-	rf.votedFor = -1
+	rf.setVotedFor(-1)
 	rf.condElectionResult.Broadcast() // end stale elections
 	rf.resetElectionTimer()           // it finds a more recent term, progress
 }
@@ -503,7 +513,7 @@ func (rf *Raft) hasNewerLogThan(lastLogIdx1, lastLogTerm1 int) bool {
 		panic("Raft::hasNewerLog: caller should hold the lock")
 	}
 	lastLogIdx0 := rf.LastLogIdx()
-	lastLogTerm0 := rf.log.At(lastLogIdx0).Term
+	lastLogTerm0 := rf.LogAt(lastLogIdx0).Term
 	ServerPrintf(dElection, rf,
 		"currentLastLogIdx=%v, currentLastLogTerm=%v, lastLogIdx=%v, lastLogTerm=%v\n",
 		lastLogIdx0, lastLogTerm0, lastLogIdx1, lastLogTerm1)
@@ -523,13 +533,59 @@ func (rf *Raft) resetElectionTimer() {
 
 func (rf *Raft) ToString() string {
 	return fmt.Sprintf("currentTerm=%v, votedFor=%v, committedIndex=%v, "+
-		"lastApplied=%v, nextIndex=%v, matchIndex=%v, log=%v", rf.currentTerm, rf.votedFor,
-		rf.commitIndex, rf.lastApplied, rf.nextIndex, rf.matchIndex, rf.log)
+		"lastApplied=%v, nextIndex=%v, matchIndex=%v, log=%v", rf.getCurrentTerm(), rf.getVotedFor(),
+		rf.commitIndex, rf.lastApplied, rf.nextIndex, rf.matchIndex, rf._log)
 	//return ""
 }
 
+// persistent fields accessor ------------------------------------
+
+func (rf *Raft) LogAt(index int) *LogEntry {
+	return rf._log.At(index)
+}
+
+func (rf *Raft) AppendLogs(entries ...LogEntry) int {
+	rf.dirty.Store(true)
+	ServerPrintf(dPersist, rf, "Appended logs, Dirty\n")
+	return rf._log.Append(entries...)
+}
+
+func (rf *Raft) SubLog(begin, end int) []LogEntry {
+	return rf._log.SubLog(begin, end)
+}
+
+func (rf *Raft) AsSubLog(begin, end int) {
+	rf.dirty.Store(true)
+	ServerPrintf(dPersist, rf, "Trimed as sublog, Dirty\n")
+	rf._log.AsSubLog(begin, end)
+}
+
+func (rf *Raft) LogLen() int {
+	return rf._log.Len()
+}
+
 func (rf *Raft) LastLogIdx() int {
-	return rf.log.Len() - 1
+	return rf._log.Len() - 1
+}
+
+func (rf *Raft) getCurrentTerm() int {
+	return rf._currentTerm
+}
+
+func (rf *Raft) getVotedFor() int {
+	return rf._votedFor
+}
+
+func (rf *Raft) setCurrentTerm(term int) {
+	rf.dirty.Store(true)
+	ServerPrintf(dPersist, rf, "Set currentTerm, Dirty\n")
+	rf._currentTerm = term
+}
+
+func (rf *Raft) setVotedFor(votedFor int) {
+	rf.dirty.Store(true)
+	ServerPrintf(dPersist, rf, "Set votedFor, Dirty\n")
+	rf._votedFor = votedFor
 }
 
 type RequestVoteArgs struct {

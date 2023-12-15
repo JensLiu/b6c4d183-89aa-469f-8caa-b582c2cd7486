@@ -19,6 +19,7 @@ const (
 	dReplicate = "REPL"
 	dCommit    = "CMIT"
 	dApply     = "APPL"
+	dPersist   = "PERS"
 )
 
 var debugStart time.Time
@@ -43,7 +44,7 @@ func RawPrintf(topic logTopic, format string, a ...interface{}) {
 
 func ServerPrintf(topic logTopic, rf *Raft, format string, a ...interface{}) {
 	args := []interface{}{
-		rf.me, rf.currentTerm, rf.currentState.ToString(),
+		rf.me, rf.getCurrentTerm(), rf.currentState.ToString(),
 	}
 	args = append(args, a...)
 	RawPrintf(topic, "S%v(T%v, %v) "+format, args...)
