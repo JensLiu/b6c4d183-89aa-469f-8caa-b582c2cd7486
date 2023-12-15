@@ -415,30 +415,36 @@ func (rf *Raft) handleStaleFollowerFaster(peerId int, reply *AppendEntriesReply)
 	from := rf.nextIndex[peerId]
 
 	// bypass log dirty detection, since we do not modify log entries
-	if _, ok := rf._log.TermIdx[reply.FallbackTerm]; !ok {
-		// stale term from follower that is ignored by the system
-		// we find the term just one less than the stale term
-		keys := make([]int, len(rf._log.TermIdx))
-		for key := range rf._log.TermIdx {
-			keys = append(keys, key)
+	_, ok := rf._log.TermIdx[reply.FallbackTerm]
+
+	var searchTerm int
+	if ok {
+		if rf.LogAt(reply.FallbackIndex).Term == reply.FallbackTerm {
+			// the prefix matches, we should fast-forward to this point rather than -1 everytime
+			rf.nextIndex[peerId] = reply.FallbackIndex
+			ServerPrintf(dAppend, rf, "nextIndex[%v]: %v -> %v\n", peerId, from, rf.nextIndex[peerId])
+			return
+		} else {
+			// not the same term, fallback one more
+			searchTerm = reply.FallbackTerm - 1
 		}
-		slices.Sort(keys)
-		i, found := slices.BinarySearch(keys, reply.FallbackTerm)
-		if !found {
-			i = max(1, i-1)
-		}
-		rf.nextIndex[peerId] = rf._log.TermIdx[keys[i]]
+	} else { // !ok
+		searchTerm = reply.FallbackTerm
 	}
-	if rf.LogAt(reply.FallbackIndex).Term == reply.FallbackTerm {
-		// the prefix matches, we should fast-forward to this point rather than -1 everytime
-		rf.nextIndex[peerId] = reply.FallbackIndex
-	} else {
-		//panic("does not found in the log")
-		rf.nextIndex[peerId] = max(reply.FallbackIndex-1, 1)
+
+	// binary search to find a matching term <= searchTerm in the leader
+	keys := make([]int, len(rf._log.TermIdx))
+	for key := range rf._log.TermIdx {
+		keys = append(keys, key)
 	}
+	slices.Sort(keys)
+	i, found := slices.BinarySearch(keys, searchTerm)
+	if !found {
+		i = max(1, i-1)
+	}
+	rf.nextIndex[peerId] = rf._log.TermIdx[keys[i]]
 
 	to := rf.nextIndex[peerId]
-
 	ServerPrintf(dAppend, rf, "nextIndex[%v]: %v -> %v\n", peerId, from, to)
 }
 
