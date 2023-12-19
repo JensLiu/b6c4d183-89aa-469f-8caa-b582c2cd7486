@@ -1,7 +1,9 @@
 package raft
 
 import (
+	"6.5840/labgob"
 	"6.5840/labrpc"
+	"bytes"
 	"fmt"
 	"math"
 	"math/rand"
@@ -93,7 +95,6 @@ func (rf *Raft) collectVote(ballot *int, peerId int) {
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	ServerPrintf(dElection, rf, "<- S%v(T%v) Request Vote\n", args.CandidateId, args.Term)
@@ -107,7 +108,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.stepDown(args.Term)
 	}
 
-	rf.applyLogs() // apply log if possible
+	//rf.applyLogs() // apply log if possible
 
 	// currentTerm >= term
 
@@ -199,6 +200,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// currentTerm = args.Term
 
 	rf.currentState = PeerFollower // Candidate may step down for the elected leader
+	// the isolated leader will never have term higher than the acting leader, since it does not start a new election
 	rf.setVotedFor(args.LeaderId)
 	rf.resetElectionTimer() // progress
 
@@ -220,11 +222,17 @@ func (rf *Raft) logConsistencyCheck(args *AppendEntriesArgs) bool {
 	lastLogIdx := rf.LastLogIdx()
 	if args.PrevLogIndex > lastLogIdx {
 		// the current log does not contain the index
-		ServerPrintf(dAppend, rf, "args.PrevLogIndex > lastLogIdx\n")
+		ServerPrintf(dAppend, rf, "args.PrevLogIndex(%v) > lastLogIdx(%v)\n", args.PrevLogIndex, lastLogIdx)
 		return false
 	}
 
 	// prevLogIdx <= lastLogIdx
+	if args.PrevLogIndex < rf.InMemLogIdx() {
+		ServerPrintf(dAppend, rf, "asking for compacted logs %v while the in memory log is %v\n",
+			args.PrevLogIndex, rf.InMemLogIdx())
+		return false
+	}
+
 	if rf.LogAt(args.PrevLogIndex).Term != args.PrevLogTerm {
 		ServerPrintf(dAppend, rf, "rf.log[args.PrevLogIndex].Term != args.PrevLogTerm\n")
 		return false
@@ -268,6 +276,59 @@ func (rf *Raft) logConsistencyCheck(args *AppendEntriesArgs) bool {
 
 // AppendEntries RPC End --------------------------------------------------------------------------
 
+// InstallSnapshot RPC Begin ----------------------------------------------------------------------
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
+	reply.Term = rf.getCurrentTerm()
+
+	ServerPrintf(dSnapshot, rf, "<- S%v(T%v) InstallSnapshot lastIdx=%v, lastTerm=%v\n", args.LeaderId,
+		args.Term, args.LastIncludedIndex, args.LastIncludedTerm)
+
+	if args.Term > rf.getCurrentTerm() {
+		rf.stepDown(args.Term)
+	}
+
+	// term <= current Term
+
+	if args.Term < rf.getCurrentTerm() {
+		return
+	}
+
+	// term = currentTerm
+
+	if args.LastIncludedIndex < rf.InMemLogIdx() {
+		return
+	}
+
+	if args.LastIncludedIndex == rf.InMemLogIdx() &&
+		rf.LogAt(args.LastIncludedIndex).Term != args.LastIncludedTerm {
+		// overwrite the stale log, since snapshot entries are committed, thus permanent
+		rf.LogAt(args.LastIncludedIndex).Term = args.LastIncludedTerm
+	}
+
+	ServerPrintf(dSnapshot, rf, "Before snapshot state: %v\n", rf.ToString())
+
+	rf.applyCh <- ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotTerm:  args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
+	}
+
+	rf.snapshot = args.Data // rf.persist will write it back to the disk
+	rf.commitIndex = args.LastIncludedIndex
+	rf.lastApplied = args.LastIncludedIndex + 1
+
+	rf.LogSnapshot(args.LastIncludedIndex, args.LastIncludedTerm)
+
+	ServerPrintf(dSnapshot, rf, "After snapshot state: %v\n", rf.ToString())
+}
+
+// InstallSnapshot RPC End ------------------------------------------------------------------------
+
 // Log Replication Begin --------------------------------------------------------------------------
 
 func (rf *Raft) replicateLogs(condWait *sync.Cond) {
@@ -277,9 +338,7 @@ func (rf *Raft) replicateLogs(condWait *sync.Cond) {
 
 	defer rf.persist()
 
-	idx := rf.LastLogIdx()
-
-	ServerRacePrintf(dReplicate, rf, "Start Replicate Logs until %v\n", idx)
+	ServerRacePrintf(dReplicate, rf, "Start Replicate Logs\n")
 
 	for peerId, peer := range rf.peers {
 		if peerId == rf.me {
@@ -299,10 +358,17 @@ func (rf *Raft) askToReplicate(peerId int, peer *labrpc.ClientEnd, condWait *syn
 		rf.mu.Unlock()
 		return
 	}
+
 	localTerm := rf.getCurrentTerm()
 	beginLogIdx := max(rf.nextIndex[peerId], 1) // nextIdx[.] >= 1, log 0 is always committed
 	prevLogIdx := beginLogIdx - 1
-	//prevLogIdx := rf.matchIndex[peerId]
+
+	if prevLogIdx < rf.InMemLogIdx() {
+		rf.useSnapshotToSyncFollower(peerId)
+		rf.mu.Unlock()
+		return
+	}
+
 	prevLogTerm := rf.LogAt(prevLogIdx).Term
 	entries := rf.SubLog(prevLogIdx+1, -1)
 	leaderCommit := rf.commitIndex
@@ -314,15 +380,18 @@ func (rf *Raft) askToReplicate(peerId int, peer *labrpc.ClientEnd, condWait *syn
 		Entries:      entries,
 		LeaderCommit: leaderCommit,
 	}
-	ServerPrintf(dReplicate, rf, "Args: %v", args.ToString())
-	ServerPrintf(dReplicate, rf, "->S%v Ask To Replicate", peerId)
+	ServerPrintf(dReplicate, rf, "->S%v Ask To Replicate, Args %v\n", peerId, args.ToString())
 	rf.mu.Unlock()
 
 	peer.Call("Raft.AppendEntries", &args, &reply)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	ServerPrintf(dReplicate, rf, "<-S%v Reply: %v", reply.ServerId, reply)
+	if rf.currentState != PeerLeader {
+		// avoid change of state during the call, it may discover a new leader
+		return
+	}
+	ServerPrintf(dReplicate, rf, "<-S%v Reply: %v, PrevLogIndex %v, EntryLen %v\n", reply.ServerId, reply, prevLogIdx, len(entries))
 	// reply for previous term, ignore
 	if rf.getCurrentTerm() > localTerm {
 		return
@@ -389,7 +458,7 @@ func (rf *Raft) askToReplicate(peerId int, peer *labrpc.ClientEnd, condWait *syn
 	}
 
 	if rf.nextIndex[peerId] == beginLogIdx {
-		rf.handleStaleFollowerFaster(peerId, &reply)
+		rf.handleStaleFollower(peerId, &reply)
 		return
 	} else {
 		// otherwise, the index has been changed by another request; we should not overwrite it
@@ -397,7 +466,8 @@ func (rf *Raft) askToReplicate(peerId int, peer *labrpc.ClientEnd, condWait *syn
 	}
 
 }
-func (rf *Raft) handleStaleFollower(peerId int, reply *AppendEntriesReply) {
+
+func (rf *Raft) handleStaleFollowerNotOptimised(peerId int, reply *AppendEntriesReply) {
 	if rf.mu.TryLock() {
 		panic("Raft::handleStaleFollower: the caller should hold the lock")
 	}
@@ -407,9 +477,17 @@ func (rf *Raft) handleStaleFollower(peerId int, reply *AppendEntriesReply) {
 	ServerPrintf(dReplicate, rf, "Slow Follower %v\n", peerId)
 }
 
-func (rf *Raft) handleStaleFollowerFaster(peerId int, reply *AppendEntriesReply) {
+func (rf *Raft) handleStaleFollower(peerId int, reply *AppendEntriesReply) {
 	if rf.mu.TryLock() {
 		panic("Raft::handleStaleFollower: the caller should hold the lock")
+	}
+
+	if reply.FallbackIndex < rf.InMemLogIdx() ||
+		reply.FallbackIndex == rf.InMemLogIdx() && rf.LogAt(rf.InMemLogIdx()).Cmd == nil {
+		ServerPrintf(dSnapshot, rf, "S%v wants to fallback to log %v that's compacted\n",
+			reply.ServerId, reply.FallbackIndex)
+		rf.nextIndex[peerId] = reply.FallbackIndex // the next heartbeat will use snapshot
+		return
 	}
 
 	from := rf.nextIndex[peerId]
@@ -448,35 +526,156 @@ func (rf *Raft) handleStaleFollowerFaster(peerId int, reply *AppendEntriesReply)
 	ServerPrintf(dAppend, rf, "nextIndex[%v]: %v -> %v\n", peerId, from, to)
 }
 
+func (rf *Raft) useSnapshotToSyncFollower(peerId int) {
+	if rf.mu.TryLock() {
+		panic("Raft::useSnapshotToSyncFollower: the caller should hold the lock")
+	}
+
+	defer rf.persist()
+
+	localTerm := rf.getCurrentTerm()
+	lastIncludedIndex := rf.InMemLogIdx()
+	lastIncludedTerm := rf.LogAt(lastIncludedIndex).Term
+	data := rf.persister.ReadSnapshot()
+
+	// validation
+	i := SnapshotLastIncludedIndex(data)
+	if i != lastIncludedIndex {
+		panic("inconsistent snapshot")
+	}
+	// validation
+
+	if len(data) == 0 {
+		panic("no snapshot")
+	}
+	args := InstallSnapshotArgs{
+		Term:              localTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: lastIncludedIndex,
+		LastIncludedTerm:  lastIncludedTerm,
+		Data:              data,
+	}
+	reply := InstallSnapshotReply{}
+
+	ServerPrintf(dSnapshot, rf, "-> S%v InstallSnapshot lastIdx=%v, lastTerm=%v\n", peerId, args.LastIncludedIndex, args.LastIncludedTerm)
+	ServerPrintf(dSnapshot, rf, "Before InstallSnapshot Request State: %v\n", rf.ToString())
+
+	rf.mu.Unlock()
+	rf.peers[peerId].Call("Raft.InstallSnapshot", &args, &reply)
+	rf.mu.Lock()
+
+	ServerPrintf(dSnapshot, rf, "<- S%v InstallSnapshot Reply: %v\n", peerId, reply)
+
+	if rf.getCurrentTerm() != localTerm {
+		return
+	}
+
+	if reply.Term == 0 {
+		// failed/timeout term
+		return
+	}
+
+	if rf.getCurrentTerm() < reply.Term {
+		rf.stepDown(reply.Term)
+	}
+
+	// since the follower is behind
+	rf.matchIndex[peerId] = lastIncludedIndex
+	rf.nextIndex[peerId] = lastIncludedIndex + 1
+
+	ServerPrintf(dSnapshot, rf, "After InstallSnapshot Request State: %v\n", rf.ToString())
+}
+
 func (rf *Raft) applyLogs() int {
 	if rf.mu.TryLock() {
 		panic("Raft::applyLog: the caller should hold the lock")
 	}
+
 	// applied index is always at most equal to the commit index
 	// thus do not check for overflow
 	applied := 0
+
 	for rf.commitIndex >= rf.lastApplied {
 		// use `for` (not `if`)
 		// because the leader may ignore a stale commit message from its follower
 		// (if reply being reordered), so it may lose the chance to apply
 		// we apply as much as possible when called
-		rf.applyCh <- ApplyMsg{
-			CommandValid:  true,
-			Command:       rf.LogAt(rf.lastApplied).Cmd,
+		cmd := rf.LogAt(rf.lastApplied).Cmd
+		if cmd == nil {
+			// placeholder for lastIncluded in snapshot
+			panic("last included")
+		}
+		msg := ApplyMsg{
+			CommandValid:  rf.lastApplied != 0,
+			Command:       cmd,
 			CommandIndex:  rf.lastApplied,
 			SnapshotValid: false,
 			Snapshot:      nil,
 			SnapshotTerm:  0,
 			SnapshotIndex: 0,
 		}
-		applied += 1
-		ServerPrintf(dApply, rf, "Apply command %v, %v\n", rf.lastApplied, rf.LogAt(rf.lastApplied))
+		ServerPrintf(dAppend, rf, "State: %v\n", rf.ToString())
+		ServerPrintf(dApply, rf, "Start Apply command %v, %v\n", rf.lastApplied, rf.LogAt(rf.lastApplied))
+		rf.applyCh <- msg
+		ServerPrintf(dApply, rf, "End Apply command %v, %v\n", rf.lastApplied, rf.LogAt(rf.lastApplied))
 		rf.lastApplied += 1
+		applied += 1
 	}
 	return applied
 }
 
 // Log Replication End --------------------------------------------------------------------------
+
+// Snapshot Begin -------------------------------------------------------------------------------
+
+// takeSnapshot is called asynchronously, otherwise the may result in deadlock
+// because snapshot and command share the same apply-channel
+func (rf *Raft) takeSnapshot(index int, snapshot []byte) {
+
+	// NOTE(jens): it may be the case:
+	//	Leader -> Sx: Replicate Log[a,b] --------------------+
+	//													     + -----> Sx <- Leader: Receive, replicate
+	//	Leader <- Snapshot, Compact to Log[b:]			     + <----- Sx -> Leader: Accept replicate Log[a,b]
+	// 	Leader -> Sx Heartbeat, Replicate Log[a,b] ----> ... |
+	//	...													 |
+	// 	Leader <- Sx: Accept replicate Log[a,b]	<------------+
+
+	// this may result in the leader sending Sx to replicate entries that's been compacted:
+	// the leader hasn't received the ack from Sx, thus resending the entries that have been compacted at heartbeat,
+	// which may result in sending the unnecessary snapshots multiple times.
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	ServerPrintf(dSnapshot, rf, "Snapshot index=%v\n", index)
+
+	if index < rf.InMemLogIdx() {
+		return
+	}
+
+	// since the API passed the whole snapshot as a param, we assume that it can fit in memory
+	defer rf.persist()
+	rf.snapshot = snapshot
+
+	// validation of snapshot
+	if index != SnapshotLastIncludedIndex(snapshot) {
+		panic("Raft::takeSnapshot: snapshot index mismatch")
+	}
+
+	// check commit
+	if rf.commitIndex < index {
+		panic("Raft::takeSnapshot: snapshotting uncommitted index\n")
+	}
+	ServerPrintf(dSnapshot, rf, "before state: %v\n", rf.ToString())
+	inMenIdx := rf.InMemLogIdx()
+	if index < inMenIdx {
+		ServerPrintf(dSnapshot, rf, "stale snapshot request: ask %v but in fact >= %v\n", index, rf.InMemLogIdx())
+		return
+	}
+	rf.LogSnapshot(index, rf.LogAt(index).Term)
+	ServerPrintf(dSnapshot, rf, "after state: %v\n", rf.ToString())
+}
+
+// Snapshot end ---------------------------------------------------------------------------------
 
 // Helpers ----------------------------------------------------------------------------------------
 func (rf *Raft) heartbeat() {
@@ -547,6 +746,12 @@ func (rf *Raft) ToString() string {
 // persistent fields accessor ------------------------------------
 
 func (rf *Raft) LogAt(index int) *LogEntry {
+	if index < rf._log.InMemIdx {
+		panic("Raft::LogAt: ask for compacted log\n")
+	}
+	if index >= rf._log.InMemIdx+len(rf._log.Entries) {
+		panic("Raft::LogAt: ask for invalid log\n")
+	}
 	return rf._log.At(index)
 }
 
@@ -574,6 +779,15 @@ func (rf *Raft) LastLogIdx() int {
 	return rf._log.Len() - 1
 }
 
+func (rf *Raft) InMemLogIdx() int { return rf._log.InMemIdx }
+
+// LogSnapshot trims/fast-forwards the log to fit the snapshot
+func (rf *Raft) LogSnapshot(lastIncludedIdx, lastIncludedTerm int) {
+	rf.dirty.Store(true)
+	ServerPrintf(dPersist, rf, "Discard logs, Dirty\n")
+	rf._log.Snapshot(lastIncludedIdx, lastIncludedTerm)
+}
+
 func (rf *Raft) getCurrentTerm() int {
 	return rf._currentTerm
 }
@@ -583,12 +797,18 @@ func (rf *Raft) getVotedFor() int {
 }
 
 func (rf *Raft) setCurrentTerm(term int) {
+	if term == rf._currentTerm {
+		return // avoid writing to disk
+	}
 	rf.dirty.Store(true)
 	ServerPrintf(dPersist, rf, "Set currentTerm, Dirty\n")
 	rf._currentTerm = term
 }
 
 func (rf *Raft) setVotedFor(votedFor int) {
+	if votedFor == rf._votedFor {
+		return
+	}
 	rf.dirty.Store(true)
 	ServerPrintf(dPersist, rf, "Set votedFor, Dirty\n")
 	rf._votedFor = votedFor
@@ -616,8 +836,8 @@ type AppendEntriesArgs struct {
 }
 
 func (args *AppendEntriesArgs) ToString() string {
-	return fmt.Sprintf("Term=%v, Leader=%v, PrevLogIndex=%v, PrevLogTerm=%v, LeaderCommit=%v",
-		args.Term, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit,
+	return fmt.Sprintf("Term=%v, Leader=%v, PrevLogIndex=%v, PrevLogTerm=%v, LeaderCommit=%v, entries=%v",
+		args.Term, args.LeaderId, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, args.Entries,
 	)
 }
 
@@ -627,4 +847,29 @@ type AppendEntriesReply struct {
 	ServerId      int  // for debug reasons
 	FallbackIndex int  // for fast follower log correction
 	FallbackTerm  int  // for fast follower log correction
+}
+
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+	// we do not split snapshots
+	//Offset            int
+	//Done              bool
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func SnapshotLastIncludedIndex(snapshot []byte) int {
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var snapLastIncludedIndex int
+	if d.Decode(&snapLastIncludedIndex) != nil {
+		panic("snapshot Decode() error")
+	}
+	return snapLastIncludedIndex
 }

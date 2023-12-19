@@ -20,6 +20,7 @@ const (
 	dCommit    = "CMIT"
 	dApply     = "APPL"
 	dPersist   = "PERS"
+	dSnapshot  = "SNAP"
 )
 
 var debugStart time.Time

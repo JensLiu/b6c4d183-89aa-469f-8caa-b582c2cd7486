@@ -57,7 +57,60 @@ func (log *Log) Len() int {
 }
 
 func (log *Log) FallBack() (index, term int) {
-	term = log.Entries[log.Len()-1].Term
+	term = log.At(log.Len() - 1).Term
 	index = log.TermIdx[term]
 	return
+}
+
+// Snapshot
+// discard logs before/until, not including index
+func (log *Log) Snapshot(lastIncludedIdx int, lastIncludedTerm int) {
+	if lastIncludedIdx < log.InMemIdx {
+		panic("Log::Snapshot: already compacted")
+	}
+
+	// fast-forward
+	if lastIncludedIdx >= log.Len() {
+		log.TermIdx = map[int]int{
+			lastIncludedTerm: lastIncludedIdx,
+		}
+		log.Entries = []LogEntry{
+			{
+				Index: lastIncludedIdx,
+				Term:  lastIncludedTerm,
+			},
+		}
+		log.InMemIdx = lastIncludedIdx
+		return
+	}
+
+	// log prefix: lastIncludedIdx < inMemIdx + len(entries) = len(Log)
+
+	// handle fallback map
+	if lastIncludedIdx > log.InMemIdx {
+		// idx-1 is in memory
+		indexTerm := log.At(lastIncludedIdx - 1).Term
+		for term := range log.TermIdx {
+			if term < indexTerm {
+				delete(log.TermIdx, term)
+			} else if term == indexTerm {
+				if log.At(lastIncludedIdx).Term == indexTerm {
+					// (idx-1, Tx) (idx, Tx) -> move to the next one
+					log.TermIdx[term] = lastIncludedIdx
+				} else {
+					// the next entry is not of the same term: (idx-1, Tx) (idx, Tx+1)
+					// delete this term
+					delete(log.TermIdx, term)
+				}
+			} else {
+				// we assume the hash function retains the numeric order of the key
+				break
+			}
+		}
+	} else {
+		// idx is the first log index in memory
+	}
+	baseIdx := lastIncludedIdx - log.InMemIdx
+	log.Entries = log.Entries[baseIdx:]
+	log.InMemIdx = lastIncludedIdx
 }

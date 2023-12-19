@@ -96,20 +96,18 @@ type Raft struct {
 	delta int //  don't overflow within timeout! see ticker()
 
 	condElectionResult *sync.Cond
-
-	heartbeatDuration time.Duration
+	heartbeatDuration  time.Duration
 
 	// persistent
-	dirty atomic.Bool // if the persistent fields have been modified
+	dirty    atomic.Bool // if the persistent fields have been modified
+	snapshot []byte
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
-	// Your code here (2A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	term = rf.getCurrentTerm()
@@ -132,15 +130,22 @@ func (rf *Raft) persist() {
 	if !rf.dirty.CompareAndSwap(true, false) {
 		return
 	}
-	ServerPrintf(dPersist, rf, "Persist: currentTerm=%v votedFor=%v logs=%v\n", rf._currentTerm, rf._votedFor,
-		rf._log)
 	writer := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(writer)
 	encoder.Encode(rf._currentTerm)
 	encoder.Encode(rf._votedFor)
 	encoder.Encode(rf._log)
 	raftState := writer.Bytes()
-	rf.persister.Save(raftState, nil)
+	if len(rf.snapshot) > 0 {
+		ServerPrintf(dPersist, rf, "Persist: currentTerm=%v votedFor=%v logs=%v snapshot\n", rf._currentTerm,
+			rf._votedFor, rf._log)
+		rf.persister.Save(raftState, rf.snapshot)
+		rf.snapshot = make([]byte, 0)
+	} else {
+		ServerPrintf(dPersist, rf, "Persist: currentTerm=%v votedFor=%v logs=%v no snapshot\n", rf._currentTerm,
+			rf._votedFor, rf._log)
+		rf.persister.Save(raftState, rf.persister.ReadSnapshot())
+	}
 }
 
 // restore previously persisted state.
@@ -177,7 +182,8 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	ServerPrintf(dSnapshot, rf, "Snapshot index %v\n", index)
+	go rf.takeSnapshot(index, snapshot)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -227,6 +233,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 
+	if command == nil {
+		panic("Raft::Start: cannot insert nil, you can choose another placeholder\n")
+	}
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -239,6 +249,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.AppendLogs(LogEntry{Index: rf.LogLen(), Term: rf.getCurrentTerm(), Cmd: command})
 
 	rf.replicateLogs(nil)
+
+	ServerPrintf(dReplicate, rf, "START RETURN: index=%v, term=%v\n", rf.LastLogIdx(), rf.getCurrentTerm())
 
 	return rf.LastLogIdx(), rf.getCurrentTerm(), true
 }
@@ -310,6 +322,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.applyCh = applyCh
+	//rf.logApplier = MakeLogApplier(applyCh, rf.me)
 	rf.currentState = PeerFollower
 	rf._currentTerm = 0
 	rf._votedFor = -1
@@ -318,18 +331,24 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		Entries:  []LogEntry{{0, 0, ""}},
 		TermIdx:  map[int]int{0: 0},
 	}
-	rf.commitIndex = 0
-	rf.lastApplied = 0
+	//rf.commitIndex = 0
+	//rf.lastApplied = 0
 	rf.nextIndex = make(map[int]int)
 	rf.matchIndex = make(map[int]int)
 	rf.delta = 0
 	rf.mu = sync.Mutex{}
 	rf.condElectionResult = sync.NewCond(&rf.mu)
-
 	rf.heartbeatDuration = 100 * time.Millisecond
+
+	rf.snapshot = make([]byte, 0)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	if rf.lastApplied < rf.InMemLogIdx() {
+		// handle restarted server
+		rf.commitIndex = rf.InMemLogIdx()
+		rf.lastApplied = rf.InMemLogIdx() + 1
+	}
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
